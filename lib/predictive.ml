@@ -1,63 +1,132 @@
-(** Predictive coding through resonance coupling.
+(** Predictive coding through complex resonance coupling.
 
-    Each layer is an oscillator bank. Predictions between layers
-    flow through the transfer function — the same equation that
-    encodes tokens. H(ω) connects everything.
+    The transfer function H(ω) is complex — it has magnitude AND phase.
+    Position = real part. Velocity = imaginary part.
+    The coupling between oscillators uses the full complex H(ω),
+    so phase relationships matter. "th" creates a different
+    interference pattern than "ht" — same oscillators, different phases.
 
-    Coupling strength: |H_j(ω_i)| — how strongly oscillator j
-    at frequency ω_j responds to oscillator i at frequency ω_i.
-    Close frequencies resonate. Far frequencies decouple.
-
-    Learning = retuning. Adjust ω and γ to minimize prediction error.
-    Two parameters per oscillator, not n² matrix entries. *)
+    Learning = retuning ω and γ via analytical dH/dω, dH/dγ. *)
 
 type layer = {
   activity : Vec.t;
   error : Vec.t;
 }
 
-(** Coupling between two layers: oscillator bank with learnable frequencies *)
 type coupling = {
-  omega : float array;    (** natural frequencies, one per output osc *)
-  gamma : float array;    (** damping ratios *)
-  source_omega : float array;  (** frequencies of the source layer *)
+  omega : float array;
+  gamma : float array;
+  source_omega : float array;
   n_out : int;
-  n_in : int;
+  n_in : int;  (** number of oscillators in source (half of source state dim) *)
 }
 
 type t = {
   layers : layer array;
-  couplings : coupling array;  (** couplings.(i) connects layer i → i+1 *)
+  couplings : coupling array;
   n_layers : int;
 }
 
-(** Transfer function magnitude: |H(ω)| = 1/√((ω₀²-ω²)² + (2γω₀ω)²) *)
-let transfer_mag ~omega0 ~gamma ~omega =
+(** Complex transfer function components:
+    H(ω) = 1 / (ω₀²-ω² + 2iγω₀ω)
+    Re[H] = (ω₀²-ω²) / D
+    Im[H] = -2γω₀ω / D
+    where D = (ω₀²-ω²)² + (2γω₀ω)² *)
+let transfer_re_im ~omega0 ~gamma ~omega =
   let w0sq = omega0 *. omega0 in
   let wsq = omega *. omega in
-  let real = w0sq -. wsq in
-  let imag = 2.0 *. gamma *. omega0 *. omega in
-  1.0 /. sqrt (real *. real +. imag *. imag +. 1e-8)
+  let real_num = w0sq -. wsq in
+  let imag_num = 2.0 *. gamma *. omega0 *. omega in
+  let d = real_num *. real_num +. imag_num *. imag_num +. 1e-8 in
+  (real_num /. d, -. imag_num /. d)
 
-(** Derivative of |H| w.r.t. omega0 (for learning) *)
-let d_transfer_d_omega0 ~omega0 ~gamma ~omega =
-  let w0sq = omega0 *. omega0 in
-  let wsq = omega *. omega in
-  let real = w0sq -. wsq in
-  let imag = 2.0 *. gamma *. omega0 *. omega in
-  let denom_sq = real *. real +. imag *. imag +. 1e-8 in
-  let d_real = 2.0 *. omega0 in
-  let d_imag = 2.0 *. gamma *. omega in
-  -. (real *. d_real +. imag *. d_imag) /. (denom_sq *. sqrt denom_sq)
+(** Predict via complex resonance.
+    Input state is [pos_0..pos_n, vel_0..vel_n] — treat as complex:
+      z_i = pos_i + i*vel_i
+    Output: z_j = Σ_i z_i * H_j(ω_i)
+    Expand: out_pos_j = Σ_i (pos_i * Re[H] - vel_i * Im[H])
+            out_vel_j = Σ_i (pos_i * Im[H] + vel_i * Re[H]) *)
+let resonate coupling (input : Vec.t) : Vec.t =
+  let n_osc = coupling.n_in in
+  Vec.create (2 * coupling.n_out) (fun k ->
+    let j = k mod coupling.n_out in
+    let is_vel = k >= coupling.n_out in
+    let w0 = coupling.omega.(j) in
+    let g = coupling.gamma.(j) in
+    let acc = ref 0.0 in
+    for i = 0 to n_osc - 1 do
+      let wi = coupling.source_omega.(i) in
+      let h_re, h_im = transfer_re_im ~omega0:w0 ~gamma:g ~omega:wi in
+      let pos_i = input.(i) in
+      let vel_i = input.(n_osc + i) in
+      if is_vel then
+        (* Imaginary part of complex multiply *)
+        acc := !acc +. pos_i *. h_im +. vel_i *. h_re
+      else
+        (* Real part of complex multiply *)
+        acc := !acc +. pos_i *. h_re -. vel_i *. h_im
+    done;
+    !acc
+  )
 
-(** Derivative of |H| w.r.t. gamma *)
-let d_transfer_d_gamma ~omega0 ~gamma:_ ~omega =
-  let w0sq = omega0 *. omega0 in
-  let wsq = omega *. omega in
-  let real = w0sq -. wsq in
-  let imag = 2.0 *. omega0 *. omega in  (* d(2γω₀ω)/dγ = 2ω₀ω *)
-  let denom_sq = real *. real +. imag *. imag +. 1e-8 in
-  -. (imag *. 2.0 *. omega0 *. omega) /. (denom_sq *. sqrt denom_sq)
+(** Propagate error backward: same complex coupling, transposed *)
+let propagate_error coupling (err : Vec.t) : Vec.t =
+  let n_osc_out = coupling.n_out in
+  Vec.create (2 * coupling.n_in) (fun k ->
+    let i = k mod coupling.n_in in
+    let is_vel = k >= coupling.n_in in
+    let wi = coupling.source_omega.(i) in
+    let acc = ref 0.0 in
+    for j = 0 to n_osc_out - 1 do
+      let w0 = coupling.omega.(j) in
+      let g = coupling.gamma.(j) in
+      let h_re, h_im = transfer_re_im ~omega0:w0 ~gamma:g ~omega:wi in
+      let err_pos = err.(j) in
+      let err_vel = err.(n_osc_out + j) in
+      if is_vel then
+        acc := !acc -. err_pos *. h_im +. err_vel *. h_re
+      else
+        acc := !acc +. err_pos *. h_re +. err_vel *. h_im
+    done;
+    !acc
+  )
+
+(** Retune: adjust ω and γ using the gradient through complex H *)
+let retune ~lr coupling (input : Vec.t) (err : Vec.t) =
+  let n_osc = coupling.n_in in
+  for j = 0 to coupling.n_out - 1 do
+    let w0 = coupling.omega.(j) in
+    let g = coupling.gamma.(j) in
+    let err_pos = err.(j) in
+    let err_vel = err.(coupling.n_out + j) in
+    let d_omega = ref 0.0 in
+    let d_gamma = ref 0.0 in
+    for i = 0 to n_osc - 1 do
+      let wi = coupling.source_omega.(i) in
+      let pos_i = input.(i) in
+      let vel_i = input.(n_osc + i) in
+      (* Numerical derivatives of H_re, H_im w.r.t. omega0 and gamma *)
+      let eps = 1e-4 in
+      let h_re, h_im = transfer_re_im ~omega0:w0 ~gamma:g ~omega:wi in
+      let h_re_dw, h_im_dw = transfer_re_im ~omega0:(w0 +. eps) ~gamma:g ~omega:wi in
+      let h_re_dg, h_im_dg = transfer_re_im ~omega0:w0 ~gamma:(g +. eps) ~omega:wi in
+      let dre_dw = (h_re_dw -. h_re) /. eps in
+      let dim_dw = (h_im_dw -. h_im) /. eps in
+      let dre_dg = (h_re_dg -. h_re) /. eps in
+      let dim_dg = (h_im_dg -. h_im) /. eps in
+      (* Chain rule through complex multiply *)
+      let d_out_pos_dw = pos_i *. dre_dw -. vel_i *. dim_dw in
+      let d_out_vel_dw = pos_i *. dim_dw +. vel_i *. dre_dw in
+      let d_out_pos_dg = pos_i *. dre_dg -. vel_i *. dim_dg in
+      let d_out_vel_dg = pos_i *. dim_dg +. vel_i *. dre_dg in
+      d_omega := !d_omega +. err_pos *. d_out_pos_dw +. err_vel *. d_out_vel_dw;
+      d_gamma := !d_gamma +. err_pos *. d_out_pos_dg +. err_vel *. d_out_vel_dg
+    done;
+    coupling.omega.(j) <- Float.max 0.01
+      (coupling.omega.(j) -. lr *. !d_omega);
+    coupling.gamma.(j) <- Float.max 0.01 (Float.min 0.99
+      (coupling.gamma.(j) -. lr *. !d_gamma))
+  done
 
 let create_coupling ~source_omega ~n_out =
   let n_in = Array.length source_omega in
@@ -70,72 +139,18 @@ let create_coupling ~source_omega ~n_out =
     n_out; n_in;
   }
 
-(** Predict via resonance: output_j = Σ_i input_i * |H_j(ω_i)| *)
-let resonate coupling (input : Vec.t) : Vec.t =
-  Vec.create coupling.n_out (fun j ->
-    let w0 = coupling.omega.(j) in
-    let g = coupling.gamma.(j) in
-    let acc = ref 0.0 in
-    for i = 0 to coupling.n_in - 1 do
-      let wi = coupling.source_omega.(i) in
-      let h = transfer_mag ~omega0:w0 ~gamma:g ~omega:wi in
-      acc := !acc +. input.(i) *. h
-    done;
-    !acc
-  )
-
-(** Propagate error backward through coupling: feedback_i = Σ_j error_j * |H_j(ω_i)| *)
-let propagate_error coupling (err : Vec.t) : Vec.t =
-  Vec.create coupling.n_in (fun i ->
-    let wi = coupling.source_omega.(i) in
-    let acc = ref 0.0 in
-    for j = 0 to coupling.n_out - 1 do
-      let w0 = coupling.omega.(j) in
-      let g = coupling.gamma.(j) in
-      let h = transfer_mag ~omega0:w0 ~gamma:g ~omega:wi in
-      acc := !acc +. err.(j) *. h
-    done;
-    !acc
-  )
-
-(** Learn: retune frequencies and damping to minimize prediction error.
-    Δω_j = -lr * Σ_i error_j * input_i * d|H_j|/dω_j(ω_i)
-    Δγ_j = -lr * Σ_i error_j * input_i * d|H_j|/dγ_j(ω_i) *)
-let retune ~lr coupling (input : Vec.t) (err : Vec.t) =
-  for j = 0 to coupling.n_out - 1 do
-    let w0 = coupling.omega.(j) in
-    let g = coupling.gamma.(j) in
-    let ej = err.(j) in
-    let d_omega = ref 0.0 in
-    let d_gamma = ref 0.0 in
-    for i = 0 to coupling.n_in - 1 do
-      let wi = coupling.source_omega.(i) in
-      let xi = input.(i) in
-      d_omega := !d_omega +. ej *. xi *.
-        d_transfer_d_omega0 ~omega0:w0 ~gamma:g ~omega:wi;
-      d_gamma := !d_gamma +. ej *. xi *.
-        d_transfer_d_gamma ~omega0:w0 ~gamma:g ~omega:wi
-    done;
-    coupling.omega.(j) <- Float.max 0.01
-      (coupling.omega.(j) -. lr *. !d_omega);
-    coupling.gamma.(j) <- Float.max 0.01 (Float.min 0.99
-      (coupling.gamma.(j) -. lr *. !d_gamma))
-  done
-
 let create dims =
   let n = Array.length dims in
-  (* Source frequencies for the encoding bank *)
-  let base_omega = Array.init dims.(0) (fun i ->
-    let f = Float.of_int i /. Float.of_int (dims.(0) - 1) in
-    0.1 +. (Float.pi -. 0.1) *. f
-  ) in
+  (* Frequencies for each layer's oscillators *)
+  let freqs_for dim =
+    let n_osc = dim / 2 in
+    Array.init n_osc (fun i ->
+      let f = Float.of_int i /. Float.max 1.0 (Float.of_int (n_osc - 1)) in
+      0.1 +. (Float.pi -. 0.1) *. f)
+  in
   let couplings = Array.init (n - 1) (fun i ->
-    let source = if i = 0 then base_omega
-      else Array.init dims.(i) (fun j ->
-        let f = Float.of_int j /. Float.of_int (dims.(i) - 1) in
-        0.1 +. (Float.pi -. 0.1) *. f)
-    in
-    create_coupling ~source_omega:source ~n_out:dims.(i + 1)
+    let source = freqs_for dims.(i) in
+    create_coupling ~source_omega:source ~n_out:(dims.(i + 1) / 2)
   ) in
   {
     n_layers = n;
