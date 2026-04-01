@@ -41,6 +41,7 @@ type t = {
   oscillators : Oscillator.t array;
   drive : float array array;       (** 256 × state_dim: strike and listen *)
   w : float array;                 (** state_dim × state_dim: rotation *)
+  w_gate : float array;            (** state_dim × state_dim: content gate *)
   mutable kernels : Bank.kernels;
   n_osc : int;
   state_dim : int;
@@ -56,10 +57,11 @@ let create n_osc seq_len =
     oscillators;
     drive = Array.init vocab_size (fun _ ->
       Array.init state_dim (fun _ -> rand ()));
-    (* W starts as identity + small noise: model begins at pure architecture baseline *)
     w = Array.init (state_dim * state_dim) (fun k ->
       let i = k / state_dim and j = k mod state_dim in
       (if i = j then 1.0 else 0.0) +. rand () *. 0.01);
+    (* Gate: starts near zero so sigmoid ≈ 0.5, passes everything equally *)
+    w_gate = Array.init (state_dim * state_dim) (fun _ -> rand () *. 0.01);
     kernels = Bank.precompute_kernels oscillators seq_len;
     n_osc; state_dim; seq_len;
   }
@@ -75,15 +77,27 @@ let resonate model tokens =
   let drives = Array.map (strike model) tokens in
   Bank.encode model.oscillators model.kernels drives
 
-(** Transform: W rotates state from physics basis to prediction basis *)
-let transform model state =
-  let dim = model.state_dim in
+(** Mat-vec: W × x, flat row-major W *)
+let mat_vec w ~dim x =
   Array.init dim (fun i ->
     let acc = ref 0.0 in
     let base = i * dim in
     for j = 0 to dim - 1 do
-      acc := !acc +. model.w.(base + j) *. state.(j)
+      acc := !acc +. w.(base + j) *. x.(j)
     done; !acc)
+
+(** Gate: sigmoid(W_gate × state) — which oscillators matter at this position *)
+let gate model state =
+  let pre = mat_vec model.w_gate ~dim:model.state_dim state in
+  Array.map (fun x -> 1.0 /. (1.0 +. exp (-. x))) pre
+
+(** Apply gate: element-wise multiply *)
+let apply_gate g state =
+  Array.map2 ( *. ) g state
+
+(** Transform: W rotates gated state to prediction basis *)
+let transform model state =
+  mat_vec model.w ~dim:model.state_dim state
 
 (** Listen: full-dimensional dot product with each drive signature *)
 let listen model transformed =
@@ -94,9 +108,11 @@ let listen model transformed =
     done; !acc
   ) model.drive
 
-(** Forward: state → logits *)
+(** Forward: state → gate → transform → listen *)
 let forward model state =
-  state |> transform model |> listen model
+  let g = gate model state in
+  let gated = apply_gate g state in
+  gated |> transform model |> listen model
 
 (** Predict: state → probabilities *)
 let predict model state =
@@ -137,7 +153,7 @@ let update_drives model transformed d_logits ~lr =
 
 (* --- Training --- *)
 
-(** Train: accumulate W gradient across positions, update once *)
+(** Train: accumulate W and W_gate gradients, update once *)
 let train_sequence model tokens ~lr =
   let seq_len = Array.length tokens in
   let dim = model.state_dim in
@@ -145,35 +161,59 @@ let train_sequence model tokens ~lr =
   let states = resonate model tokens in
 
   let w_grad = Array.make (dim * dim) 0.0 in
+  let wg_grad = Array.make (dim * dim) 0.0 in
   let total_loss = ref 0.0 in
 
   for t = 0 to seq_len - 2 do
     let state = states.(t) in
     let target = tokens.(t + 1) in
-    let transformed = transform model state in
-    let probs = predict model state in
+
+    (* Forward: gate → apply → transform → listen *)
+    let g = gate model state in
+    let gated = apply_gate g state in
+    let transformed = transform model gated in
+    let probs = softmax (listen model transformed) in
     total_loss := !total_loss +. cross_entropy ~target probs;
 
     let d_logits = logit_gradient ~target probs in
     let d_transformed = listen_backward model d_logits in
 
-    (* Accumulate W gradient *)
+    (* Gradient through W: d_gated = W^T × d_transformed *)
+    let d_gated = Array.init dim (fun j ->
+      let acc = ref 0.0 in
+      for i = 0 to dim - 1 do
+        acc := !acc +. model.w.(i * dim + j) *. d_transformed.(i)
+      done; !acc) in
+
+    (* Accumulate W gradient: outer(d_transformed, gated) *)
+    Array.iteri (fun i di ->
+      if Float.abs di > 1e-8 then begin
+        let base = i * dim in
+        Array.iteri (fun j gj ->
+          w_grad.(base + j) <- w_grad.(base + j) +. di *. gj
+        ) gated end
+    ) d_transformed;
+
+    (* Gradient through gate: d_gate = d_gated × state, then × sigmoid'(pre) *)
+    let d_gate = Array.init dim (fun i ->
+      d_gated.(i) *. state.(i) *. g.(i) *. (1.0 -. g.(i))) in
+
+    (* Accumulate W_gate gradient: outer(d_gate, state) *)
     Array.iteri (fun i di ->
       if Float.abs di > 1e-8 then begin
         let base = i * dim in
         Array.iteri (fun j sj ->
-          w_grad.(base + j) <- w_grad.(base + j) +. di *. sj
+          wg_grad.(base + j) <- wg_grad.(base + j) +. di *. sj
         ) state end
-    ) d_transformed;
+    ) d_gate;
 
-    (* Drive updates are per-byte, apply immediately *)
+    (* Drive updates immediate *)
     update_drives model transformed d_logits ~lr:lr_scaled
   done;
 
-  (* Single W update *)
-  Array.iteri (fun i g ->
-    model.w.(i) <- model.w.(i) -. lr_scaled *. g
-  ) w_grad;
+  (* Single W and W_gate update *)
+  Array.iteri (fun i g -> model.w.(i) <- model.w.(i) -. lr_scaled *. g) w_grad;
+  Array.iteri (fun i g -> model.w_gate.(i) <- model.w_gate.(i) -. lr_scaled *. g) wg_grad;
 
   !total_loss /. Float.of_int (seq_len - 1)
 
