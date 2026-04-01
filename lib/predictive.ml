@@ -1,30 +1,29 @@
-(** Predictive coding with lateral inhibition.
+(** Predictive coding with dendrite → oscillator → axon coupling.
 
-    Each layer = population of oscillators.
-    Between layers = resonance coupling (complex H(ω)).
-    Within layers = lateral inhibition (competition).
+    Each coupling has three parts (like a neuron):
+      B (dendrite) — dense input projection, selects what to receive
+      A (cell body) — oscillator kernel, resonance dynamics
+      C (axon)     — dense output projection, selects what to broadcast
 
-    The settle loop:
-      1. Compute prediction errors (top-down vs actual)
-      2. Settle hidden activities (minimize errors)
-      3. Sharpen via lateral inhibition (winners suppress losers)
-      4. Update coupling frequencies (retune to reduce errors)
-
-    This is how cortex works:
-      excitatory neurons + inhibitory interneurons + hierarchical prediction *)
+    Prediction: pred = C × resonate(A, B × activity)
+    Learning: B, C update via Hebbian (local), A retunes via dH/dω *)
 
 type layer = {
   activity : Vec.t;
   error : Vec.t;
-  n_osc : int;     (** number of oscillators in this layer *)
+  n_osc : int;
 }
 
+(** A coupling = dendrite (B) → oscillator (A) → axon (C) *)
 type coupling = {
-  omega : float array;
-  gamma : float array;
+  b : Vec.mat;           (** dendrite: input_dim → n_osc *)
+  omega : float array;   (** oscillator frequencies *)
+  gamma : float array;   (** oscillator damping *)
   source_omega : float array;
-  n_out : int;
-  n_in : int;
+  c : Vec.mat;           (** axon: n_osc → output_dim *)
+  n_osc : int;           (** oscillators in this coupling *)
+  n_in : int;            (** input state dimension *)
+  n_out : int;           (** output state dimension *)
 }
 
 type t = {
@@ -33,77 +32,109 @@ type t = {
   n_layers : int;
 }
 
-(** Complex transfer function: Re[H] and Im[H] *)
+(** Complex transfer function components *)
 let transfer_re_im ~omega0 ~gamma ~omega =
   let w0sq = omega0 *. omega0 in
   let wsq = omega *. omega in
-  let real_num = w0sq -. wsq in
-  let imag_num = 2.0 *. gamma *. omega0 *. omega in
-  let d = real_num *. real_num +. imag_num *. imag_num +. 1e-8 in
-  (real_num /. d, -. imag_num /. d)
+  let re = w0sq -. wsq in
+  let im = 2.0 *. gamma *. omega0 *. omega in
+  let d = re *. re +. im *. im +. 1e-8 in
+  (re /. d, -. im /. d)
 
-(** Complex resonance coupling: z_j = Σ_i z_i * H_j(ω_i) *)
-let resonate coupling (input : Vec.t) : Vec.t =
-  let n_in = coupling.n_in in
-  Vec.create (2 * coupling.n_out) (fun k ->
-    let j = k mod coupling.n_out in
-    let is_vel = k >= coupling.n_out in
-    let w0 = coupling.omega.(j) in
-    let g = coupling.gamma.(j) in
+(** Core resonance: complex coupling through H(ω).
+    Input and output are n_osc-dimensional [pos; vel] vectors. *)
+let resonate ~omega ~gamma ~source_omega n_osc (input : Vec.t) : Vec.t =
+  Vec.create (2 * n_osc) (fun k ->
+    let j = k mod n_osc in
+    let is_vel = k >= n_osc in
+    let w0 = omega.(j) in
+    let g = gamma.(j) in
     let acc = ref 0.0 in
-    for i = 0 to n_in - 1 do
-      let wi = coupling.source_omega.(i) in
+    for i = 0 to n_osc - 1 do
+      let wi = source_omega.(i) in
       let h_re, h_im = transfer_re_im ~omega0:w0 ~gamma:g ~omega:wi in
       let p = input.(i) in
-      let v = input.(n_in + i) in
+      let v = input.(n_osc + i) in
       if is_vel then acc := !acc +. p *. h_im +. v *. h_re
       else acc := !acc +. p *. h_re -. v *. h_im
     done;
     !acc
   )
 
-(** Backward coupling for error propagation *)
-let propagate_error coupling (err : Vec.t) : Vec.t =
-  let n_out = coupling.n_out in
-  Vec.create (2 * coupling.n_in) (fun k ->
-    let i = k mod coupling.n_in in
-    let is_vel = k >= coupling.n_in in
+(** Full prediction: dendrite → resonate → axon
+    pred = C × resonate(A, B × input) *)
+let predict coupling input =
+  let n = coupling.n_osc in
+  (* Dendrite: project input into oscillator space *)
+  let projected = Vec.mat_t_vec coupling.b input in
+  (* Resonate: complex coupling through transfer function *)
+  let resonated = resonate
+    ~omega:coupling.omega ~gamma:coupling.gamma
+    ~source_omega:coupling.source_omega n projected in
+  (* Axon: project back to output space *)
+  Vec.mat_t_vec coupling.c resonated
+
+(** Backward: propagate error through axon → resonate → dendrite *)
+let propagate_error coupling err =
+  let n = coupling.n_osc in
+  (* Through axon (C^T) *)
+  let err_osc = Vec.mat_vec coupling.c err in
+  (* Through resonance (transpose coupling) *)
+  let err_resonated = Vec.create (2 * n) (fun k ->
+    let i = k mod n in
+    let is_vel = k >= n in
     let wi = coupling.source_omega.(i) in
     let acc = ref 0.0 in
-    for j = 0 to n_out - 1 do
+    for j = 0 to n - 1 do
       let w0 = coupling.omega.(j) in
       let g = coupling.gamma.(j) in
       let h_re, h_im = transfer_re_im ~omega0:w0 ~gamma:g ~omega:wi in
-      let ep = err.(j) in
-      let ev = err.(n_out + j) in
+      let ep = err_osc.(j) in
+      let ev = err_osc.(n + j) in
       if is_vel then acc := !acc -. ep *. h_im +. ev *. h_re
       else acc := !acc +. ep *. h_re +. ev *. h_im
     done;
     !acc
-  )
+  ) in
+  (* Through dendrite (B^T) *)
+  Vec.mat_vec coupling.b err_resonated
 
-(** Retune coupling frequencies from prediction error *)
-let retune ~lr coupling (input : Vec.t) (err : Vec.t) =
-  let n_in = coupling.n_in in
+(** Learn: update dendrite (B), axon (C), and retune oscillators (A).
+    All Hebbian — activity × error. *)
+let learn_coupling ~lr coupling input err =
+  let n = coupling.n_osc in
+  (* Recompute intermediates for learning *)
+  let projected = Vec.mat_t_vec coupling.b input in
+  let resonated = resonate
+    ~omega:coupling.omega ~gamma:coupling.gamma
+    ~source_omega:coupling.source_omega n projected in
+
+  (* Update axon C: Hebbian on resonated × error *)
+  Vec.mat_outer_update ~lr:(-.lr) coupling.c resonated err;
+
+  (* Error through axon for oscillator + dendrite learning *)
+  let err_osc = Vec.mat_vec coupling.c err in
+
+  (* Retune oscillators: adjust ω, γ *)
   let eps = 1e-4 in
-  for j = 0 to coupling.n_out - 1 do
+  for j = 0 to n - 1 do
     let w0 = coupling.omega.(j) in
     let g = coupling.gamma.(j) in
-    let ep = err.(j) in
-    let ev = err.(coupling.n_out + j) in
+    let ep = err_osc.(j) in
+    let ev = err_osc.(n + j) in
     let d_omega = ref 0.0 in
     let d_gamma = ref 0.0 in
-    for i = 0 to n_in - 1 do
+    for i = 0 to n - 1 do
       let wi = coupling.source_omega.(i) in
-      let p = input.(i) in
-      let v = input.(n_in + i) in
+      let p = projected.(i) in
+      let v = projected.(n + i) in
       let h_re, h_im = transfer_re_im ~omega0:w0 ~gamma:g ~omega:wi in
-      let h_re_dw, h_im_dw = transfer_re_im ~omega0:(w0 +. eps) ~gamma:g ~omega:wi in
-      let h_re_dg, h_im_dg = transfer_re_im ~omega0:w0 ~gamma:(g +. eps) ~omega:wi in
-      let dre_dw = (h_re_dw -. h_re) /. eps in
-      let dim_dw = (h_im_dw -. h_im) /. eps in
-      let dre_dg = (h_re_dg -. h_re) /. eps in
-      let dim_dg = (h_im_dg -. h_im) /. eps in
+      let h_re', h_im' = transfer_re_im ~omega0:(w0 +. eps) ~gamma:g ~omega:wi in
+      let g_re, g_im = transfer_re_im ~omega0:w0 ~gamma:(g +. eps) ~omega:wi in
+      let dre_dw = (h_re' -. h_re) /. eps in
+      let dim_dw = (h_im' -. h_im) /. eps in
+      let dre_dg = (g_re -. h_re) /. eps in
+      let dim_dg = (g_im -. h_im) /. eps in
       d_omega := !d_omega
         +. ep *. (p *. dre_dw -. v *. dim_dw)
         +. ev *. (p *. dim_dw +. v *. dre_dw);
@@ -113,43 +144,65 @@ let retune ~lr coupling (input : Vec.t) (err : Vec.t) =
     done;
     coupling.omega.(j) <- Float.max 0.01 (coupling.omega.(j) -. lr *. !d_omega);
     coupling.gamma.(j) <- Float.max 0.01 (Float.min 0.99 (coupling.gamma.(j) -. lr *. !d_gamma))
-  done
+  done;
+
+  (* Update dendrite B: Hebbian on input × error_through_resonance *)
+  let err_pre = Vec.create (2 * n) (fun k ->
+    let i = k mod n in
+    let is_vel = k >= n in
+    let wi = coupling.source_omega.(i) in
+    let acc = ref 0.0 in
+    for j = 0 to n - 1 do
+      let w0 = coupling.omega.(j) in
+      let g = coupling.gamma.(j) in
+      let h_re, h_im = transfer_re_im ~omega0:w0 ~gamma:g ~omega:wi in
+      let epp = err_osc.(j) in
+      let evv = err_osc.(n + j) in
+      if is_vel then acc := !acc -. epp *. h_im +. evv *. h_re
+      else acc := !acc +. epp *. h_re +. evv *. h_im
+    done;
+    !acc
+  ) in
+  Vec.mat_outer_update ~lr:(-.lr) coupling.b input err_pre
 
 let make_freqs n =
   Array.init n (fun i ->
     let f = Float.of_int i /. Float.max 1.0 (Float.of_int (n - 1)) in
     0.1 +. (Float.pi -. 0.1) *. f)
 
-let create_coupling ~n_in ~n_out =
+let create_coupling ~n_in ~n_out ~n_osc =
+  let scale = sqrt (2.0 /. Float.of_int (n_in + n_osc)) in
   {
-    omega = make_freqs n_out;
-    gamma = Array.make n_out 0.1;
-    source_omega = make_freqs n_in;
-    n_out; n_in;
+    b = Vec.mat_rand ~rows:n_in ~cols:(2 * n_osc) ~scale;
+    omega = make_freqs n_osc;
+    gamma = Array.make n_osc 0.1;
+    source_omega = make_freqs n_osc;
+    c = Vec.mat_rand ~rows:(2 * n_osc) ~cols:n_out ~scale;
+    n_osc; n_in; n_out;
   }
 
 let create dims =
   let n = Array.length dims in
-  let osc_dims = Array.map (fun d -> d / 2) dims in
+  let osc_per_layer = Array.map (fun d -> d / 2) dims in
   {
     n_layers = n;
     layers = Array.init n (fun i ->
       { activity = Vec.zeros dims.(i);
         error = Vec.zeros dims.(i);
-        n_osc = osc_dims.(i) });
+        n_osc = osc_per_layer.(i) });
     couplings = Array.init (n - 1) (fun i ->
-      create_coupling ~n_in:osc_dims.(i) ~n_out:osc_dims.(i + 1));
+      let n_osc = Int.min osc_per_layer.(i) osc_per_layer.(i + 1) in
+      create_coupling ~n_in:dims.(i) ~n_out:dims.(i + 1) ~n_osc);
   }
 
 let compute_errors t =
   let layers = Array.copy t.layers in
   for i = 1 to t.n_layers - 1 do
-    let predicted = resonate t.couplings.(i - 1) layers.(i - 1).activity in
+    let predicted = predict t.couplings.(i - 1) layers.(i - 1).activity in
     layers.(i) <- { layers.(i) with error = Vec.sub layers.(i).activity predicted }
   done;
   { t with layers }
 
-(** Settle hidden layers + lateral inhibition *)
 let settle ~lr t =
   let layers = Array.copy t.layers in
   for i = 1 to t.n_layers - 2 do
@@ -161,7 +214,6 @@ let settle ~lr t =
     in
     let new_act = Vec.add t.layers.(i).activity
       (Vec.scale lr (Vec.sub feedback own_err)) in
-    (* Lateral inhibition: oscillators compete *)
     let sharpened = Inhibit.sharpen ~n_osc:t.layers.(i).n_osc new_act in
     layers.(i) <- { layers.(i) with activity = sharpened }
   done;
@@ -169,7 +221,8 @@ let settle ~lr t =
 
 let learn ~lr t =
   for i = 0 to t.n_layers - 2 do
-    retune ~lr t.couplings.(i) t.layers.(i).activity t.layers.(i + 1).error
+    learn_coupling ~lr t.couplings.(i)
+      t.layers.(i).activity t.layers.(i + 1).error
   done;
   t
 
@@ -178,10 +231,9 @@ let clamp state t =
   layers.(0) <- { layers.(0) with activity = state };
   { t with layers }
 
-(** Full iPC step: clamp → errors → settle+inhibit → learn *)
-let step ~activity_lr ~weight_lr (net : t) (inp : Vec.t) =
+let step ~activity_lr ~weight_lr input (net : t) =
   net
-  |> clamp inp
+  |> clamp input
   |> compute_errors
   |> settle ~lr:activity_lr
   |> compute_errors

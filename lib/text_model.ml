@@ -43,7 +43,7 @@ let settle m ~iters ~activity_lr =
   let input = m.state in
   let pc = ref m.pc in
   for _ = 1 to iters do
-    pc := Predictive.step !pc input ~activity_lr ~weight_lr:0.0
+    pc := Predictive.step ~activity_lr ~weight_lr:0.0 input !pc
   done;
   m.pc <- !pc
 
@@ -86,7 +86,7 @@ let inject_top_error m top_err ~lr =
 let settle_and_learn m ~iters ~activity_lr ~weight_lr =
   let input = m.state in
   for _ = 1 to iters do
-    m.pc <- Predictive.step m.pc input ~activity_lr ~weight_lr
+    m.pc <- Predictive.step ~activity_lr ~weight_lr input m.pc
   done
 
 (** Update drive signatures from output error.
