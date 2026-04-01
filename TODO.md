@@ -1,41 +1,36 @@
 # Resonance OCaml — TODO
 
 ## Done
-- [x] Transfer function H(ω) = 1/(ω₀² - ω² + 2iγω)
-- [x] Oscillator bank with exact ODE step
-- [x] Predictive coding with local Hebbian updates (iPC)
-- [x] Resonance coupling (transfer function replaces weight matrices)
-- [x] Complex phase coupling (Re + Im, not just |H|)
-- [x] Lateral inhibition (divisive normalization, oscillator competition)
+- [x] Oscillator bank with FFT convolution (Owl)
 - [x] Weight-tied drive (strike and listen same signature)
-- [x] Continuous stream (no reset, oscillators ring forever)
-- [x] Shakespeare training: loss 5.54 → 3.10 BPC
+- [x] Learned W transform → broke 3.1 BPC floor → 2.37 BPC
+- [x] Prism: composed couple-shuffle layers replacing matrix multiply
+- [x] OCaml 5 parallel (Domain-based batch training)
+- [x] Precomputed FFT kernels
+- [x] Named function pipeline: strike → resonate → transform → listen → predict
 
-## Findings
-- Feedforward init KILLS learning (erases temporal memory)
-- tanh activation works but slightly worse than linear
-- Magnitude-only vs complex coupling: no significant difference
-- Lateral inhibition: no improvement over baseline
-- 20 settle steps vs 3: no improvement
-- ODE step vs crude decay: no improvement
-- Floor at ~3.1 BPC regardless of: model size (32-64 osc),
-  layers (2-3), coupling type, settle depth, inhibition
-- The Python version worked because it had learned linear transforms
-  (emit, gate, out_proj, feed-forward) — 7×state_dim² free params/layer
+## Key findings
+- Predictive coding layers add zero over raw bank + drive
+- Feedforward init kills learning (erases temporal memory)
+- SineGate MLP worse than linear W (oscillator bank IS the nonlinearity)
+- Prism converges 6x faster than dense W matrix
+- Single W: 2.37 BPC. Prism: testing now (50K run)
+- No matrix multiply needed — O(n log n) prism matches O(n²) W
 
-## The open question
-How to get content-dependent routing without free weight matrices?
-The brain does it. We haven't found how yet.
+## Architecture
+```
+tokens |> strike (drive lookup)
+       |> resonate (FFT convolve with h(t))
+       |> prism (couple → shuffle → couple → ...)
+       |> listen (dot with drive signatures)
+       |> softmax → next byte
+```
+Zero matrix multiplies. Every op is O(n) or O(n log n).
 
-Candidates:
-- Phase synchronization (Kuramoto-style)
-- Oscillator emit/gate banks (transfer function as learned filter)
-- Recurrent coupling (lateral connections within a layer)
-- Multiple time scales (fast/slow oscillators for different context)
-- Spike-based gating (threshold + reset dynamics)
-
-## Infrastructure
-- [ ] OCaml 5 for parallel (Eio structured concurrency)
-- [ ] Owl for FFT (causal convolution over full sequence)
+## Next
 - [ ] Push to GitHub
+- [ ] Scale: more oscillators, longer sequences
+- [ ] Stack multiple prism+bank layers with residuals
+- [ ] S4-style HiPPO initialization for oscillator frequencies
 - [ ] RISC-V cross-compilation
+- [ ] Benchmark against S4/Mamba at same param count
