@@ -1,13 +1,14 @@
-(** Resonance — strike and listen, untied.
+(** Resonance — the pure architecture with learnable frequencies.
 
     tokens |> strike |> resonate |> listen |> softmax
 
-    Strike and listen use SEPARATE signatures. A good force
-    for driving oscillator 5 isn't necessarily a good pattern
-    for detecting "the letter e" in the output. They specialize.
+    Learning:
+      drive signatures — gradient descent on dot product error
+      oscillator ω, γ  — analytical dH/dω retuning
 
-    Still no matrix multiply. Just dot products both ways.
-    The bank IS the model. Learning IS retuning signatures. *)
+    The bank IS the model. The drive IS the readout.
+    Learning IS retuning the instrument AND adjusting the ear.
+    No matrix multiply. No transform. Just physics and dot products. *)
 
 let vocab_size = 256
 
@@ -35,9 +36,8 @@ let sample ~temperature logits =
 (* --- Model --- *)
 
 type t = {
-  oscillators : Oscillator.t array;
-  strike_sig : float array array;  (** 256 × n_osc: how each byte drives the bank *)
-  listen_sig : float array array;  (** 256 × state_dim: what pattern to detect *)
+  mutable oscillators : Oscillator.t array;
+  drive : float array array;       (** 256 × state_dim: full-dimensional *)
   mutable kernels : Bank.kernels;
   n_osc : int;
   state_dim : int;
@@ -46,37 +46,35 @@ type t = {
 
 let create n_osc seq_len =
   let state_dim = 2 * n_osc in
-  let scale_s = 1.0 /. sqrt (Float.of_int n_osc) in
-  let scale_l = 1.0 /. sqrt (Float.of_int state_dim) in
+  let scale = 1.0 /. sqrt (Float.of_int state_dim) in
   let oscillators = Oscillator.spread n_osc in
   {
     oscillators;
-    strike_sig = Array.init vocab_size (fun _ ->
-      Array.init n_osc (fun _ -> (Random.float 2.0 -. 1.0) *. scale_s));
-    listen_sig = Array.init vocab_size (fun _ ->
-      Array.init state_dim (fun _ -> (Random.float 2.0 -. 1.0) *. scale_l));
+    drive = Array.init vocab_size (fun _ ->
+      Array.init state_dim (fun _ -> (Random.float 2.0 -. 1.0) *. scale));
     kernels = Bank.precompute_kernels oscillators seq_len;
     n_osc; state_dim; seq_len;
   }
 
 (* --- Pipeline --- *)
 
-(** Strike: byte → force vector *)
-let strike model token = model.strike_sig.(token)
+(** Strike: first n_osc components of drive signature *)
+let strike model token =
+  Array.init model.n_osc (fun i -> model.drive.(token).(i))
 
-(** Resonate: drives → FFT convolve → causal states *)
+(** Resonate: FFT convolve drives with h(t) *)
 let resonate model tokens =
   let drives = Array.map (strike model) tokens in
   Bank.encode model.oscillators model.kernels drives
 
-(** Listen: dot product of state with each byte's listen signature *)
+(** Listen: full-dimensional dot product *)
 let listen model state =
   Array.map (fun sig_ ->
     let acc = ref 0.0 in
     for i = 0 to model.state_dim - 1 do
       acc := !acc +. state.(i) *. sig_.(i)
     done; !acc
-  ) model.listen_sig
+  ) model.drive
 
 (** Forward: state → logits *)
 let forward model state = listen model state
@@ -86,55 +84,69 @@ let predict model state = forward model state |> softmax
 
 (* --- Learning --- *)
 
-(** Update listen signatures from output gradient *)
-let update_listen model state d_logits ~lr =
+(** Update drive signatures *)
+let update_drives model state d_logits ~lr =
   Array.iteri (fun b sig_ ->
     let dl = d_logits.(b) in
     if Float.abs dl > 1e-6 then
       Array.iteri (fun j _ ->
         sig_.(j) <- sig_.(j) -. lr *. dl *. state.(j)
       ) sig_
-  ) model.listen_sig
+  ) model.drive
 
-(** Update strike signatures from state error.
-    The gradient flows: d_logits → listen → state → bank → strike.
-    Approximate: use the listen gradient projected back. *)
-let update_strike model d_logits ~state:_ ~target ~lr =
-  (* d_state = listen_sig^T × d_logits *)
-  let d_state = Array.init model.state_dim (fun j ->
+(** Compute d_loss/d_state from logit gradient *)
+let state_gradient model d_logits =
+  Array.init model.state_dim (fun j ->
     let acc = ref 0.0 in
     Array.iteri (fun b sig_ ->
       let dl = d_logits.(b) in
-      if Float.abs dl > 1e-8 then acc := !acc +. dl *. sig_.(j)
-    ) model.listen_sig; !acc) in
-  (* Update the current token's strike signature *)
-  let sig_ = model.strike_sig.(target) in
-  Array.iteri (fun j _ ->
-    if j < model.n_osc then
-      sig_.(j) <- sig_.(j) -. lr *. d_state.(j)
-  ) sig_
+      if Float.abs dl > 1e-8 then
+        acc := !acc +. dl *. sig_.(j)
+    ) model.drive; !acc)
 
-(** Learn from one position *)
-let learn_position model ~state ~target ~token ~lr =
-  let probs = predict model state in
-  let loss = cross_entropy ~target probs in
-  let d_logits = logit_gradient ~target probs in
-  update_listen model state d_logits ~lr;
-  update_strike model d_logits ~state ~target:token ~lr;
-  loss
+(** Retune oscillator frequencies from prediction error.
+    d_loss/d_ω_k = Σ_t d_loss/d_state_t · d_state_t/d_ω_k
+    where d_state/d_ω is computed by convolving drives with dh/dω *)
+let retune_frequencies model tokens d_states ~lr =
+  let drives = Array.map (strike model) tokens in
+  let d_omega = Bank.encode_deriv model.oscillators model.kernels drives in
+  let n_osc = model.n_osc in
+  let seq_len = Array.length tokens in
+  (* For each oscillator, accumulate gradient across positions *)
+  let new_oscs = Array.mapi (fun k osc ->
+    let grad = ref 0.0 in
+    for t = 0 to seq_len - 2 do
+      let d_state = d_states.(t) in
+      let dpos, dvel = d_omega.(k).(t) in
+      (* d_loss/d_ω_k += d_state_pos_k × dh_pos/dω + d_state_vel_k × dh_vel/dω *)
+      grad := !grad +. d_state.(k) *. dpos +. d_state.(n_osc + k) *. dvel
+    done;
+    let new_omega = Float.max 0.01 (osc.Oscillator.omega0 -. lr *. !grad) in
+    Oscillator.create new_omega osc.Oscillator.gamma
+  ) model.oscillators in
+  model.oscillators <- new_oscs;
+  model.kernels <- Bank.precompute_kernels new_oscs model.seq_len
 
-(* --- Training --- *)
-
+(** Train on a token sequence *)
 let train_sequence model tokens ~lr =
   let seq_len = Array.length tokens in
   let lr_scaled = lr /. Float.of_int seq_len in
   let states = resonate model tokens in
+
+  (* Forward + gradient at each position *)
   let total_loss = ref 0.0 in
-  for t = 0 to seq_len - 2 do
-    total_loss := !total_loss +.
-      learn_position model ~state:states.(t)
-        ~target:tokens.(t + 1) ~token:tokens.(t) ~lr:lr_scaled
-  done;
+  let d_states = Array.init (seq_len - 1) (fun t ->
+    let probs = predict model states.(t) in
+    let target = tokens.(t + 1) in
+    total_loss := !total_loss +. cross_entropy ~target probs;
+    let d_logits = logit_gradient ~target probs in
+    update_drives model states.(t) d_logits ~lr:lr_scaled;
+    state_gradient model d_logits
+  ) in
+
+  (* Retune oscillator frequencies every step *)
+  retune_frequencies model tokens d_states ~lr:(lr_scaled *. 0.1);
+
   !total_loss /. Float.of_int (seq_len - 1)
 
 (* --- Generation --- *)
