@@ -1,123 +1,145 @@
-(** Text model — the whole thing, clean.
+(** Text model — FFT bank → learned projection → readout.
 
-    byte_sequence
-    |> lookup drive signatures
-    |> FFT convolve through oscillator bank
-    |> dot product with drive signatures (weight-tied)
-    |> softmax → next byte prediction
+    tokens
+    |> drive forces
+    |> FFT convolve with h(t)    — oscillator physics
+    |> W × state                 — learned transformation
+    |> dot with drive signatures — weight-tied readout
+    |> softmax → next byte
 
-    No PC layers. No coupling. No settling.
-    Just: oscillator bank + weight-tied readout.
-    This is what actually works. Everything else was noise. *)
+    The bank computes rich causal states (physics).
+    W transforms them into prediction-useful space (learning).
+    Drive signatures are used for both input and output (tying). *)
 
 let vocab_size = 256
 
 type t = {
   oscillators : Oscillator.t array;
-  drive : float array array;  (** 256 × n_osc: byte → resonance signature *)
+  drive : float array array;   (** 256 × n_osc *)
+  w : float array;             (** state_dim × state_dim, flat row-major *)
   n_osc : int;
   state_dim : int;
 }
 
 let create n_osc =
   let state_dim = 2 * n_osc in
-  let scale = 1.0 /. sqrt (Float.of_int n_osc) in
+  let scale = 1.0 /. sqrt (Float.of_int state_dim) in
   {
     oscillators = Oscillator.spread n_osc;
     drive = Array.init vocab_size (fun _ ->
       Array.init n_osc (fun _ -> (Random.float 2.0 -. 1.0) *. scale));
+    w = Array.init (state_dim * state_dim) (fun _ ->
+      (Random.float 2.0 -. 1.0) *. scale);
     n_osc;
     state_dim;
   }
 
-(** Byte → drive forces (lookup) *)
-let strike model token = model.drive.(token)
+(** Matrix-vector multiply: y = W × x (W is flat row-major) *)
+let mat_vec w ~rows ~cols x =
+  Array.init rows (fun i ->
+    let acc = ref 0.0 in
+    let base = i * cols in
+    for j = 0 to cols - 1 do
+      acc := !acc +. w.(base + j) *. x.(j)
+    done;
+    !acc)
 
-(** State → logits: dot product with every byte's drive signature.
-    Only uses position components for the dot product. *)
-let listen model state =
+(** Transform bank state through learned W *)
+let transform model state =
+  mat_vec model.w ~rows:model.state_dim ~cols:model.state_dim state
+
+(** State → logits: dot product of transformed state with drive signatures *)
+let listen model transformed =
   Array.map (fun sig_ ->
     let acc = ref 0.0 in
     for i = 0 to model.n_osc - 1 do
-      acc := !acc +. state.(i) *. sig_.(i)
-               +. state.(model.n_osc + i) *. sig_.(i)
+      acc := !acc +. transformed.(i) *. sig_.(i)
+               +. transformed.(model.n_osc + i) *. sig_.(i)
     done;
     !acc
   ) model.drive
 
-(** Softmax *)
-let softmax logits =
-  let mx = Array.fold_left Float.max neg_infinity logits in
-  let exps = Array.map (fun l -> exp (l -. mx)) logits in
+let softmax v =
+  let mx = Array.fold_left Float.max neg_infinity v in
+  let exps = Array.map (fun l -> exp (l -. mx)) v in
   let s = Array.fold_left ( +. ) 0.0 exps in
   Array.map (fun e -> e /. s) exps
 
-(** Cross-entropy loss *)
 let cross_entropy ~target probs =
   -. log (Float.max 1e-10 probs.(target))
 
-(** Output error: prob - one_hot *)
-let output_error ~target probs =
-  Array.mapi (fun i p -> p -. (if i = target then 1.0 else 0.0)) probs
+(** Gradient of loss w.r.t. W.
+    d_loss/d_W = outer(d_loss/d_transformed, state)
+    d_loss/d_transformed = drive^T × (prob - one_hot)
 
-(** Update drive weights from output error.
-    Both directions: as output (all bytes) and as input (current byte). *)
-let update_drives model ~token ~target:_ ~output_err ~state ~lr =
-  let top = state in
-  (* Output direction: all drive signatures adjust *)
+    Then W -= lr × gradient. Local, no global backward pass. *)
+let update_w model ~state ~transformed ~probs ~target ~lr =
+  let dim = model.state_dim in
+  (* d_loss/d_logits = prob - one_hot *)
+  let d_logits = Array.mapi (fun i p ->
+    p -. (if i = target then 1.0 else 0.0)) probs in
+  (* d_loss/d_transformed = drive^T × d_logits *)
+  let d_transformed = Array.init dim (fun j ->
+    let acc = ref 0.0 in
+    Array.iteri (fun b sig_ ->
+      let dl = d_logits.(b) in
+      if Float.abs dl > 1e-8 then begin
+        let s = sig_.(j mod model.n_osc) in
+        acc := !acc +. dl *. s
+      end
+    ) model.drive;
+    !acc
+  ) in
+  (* W -= lr × outer(d_transformed, state) *)
+  for i = 0 to dim - 1 do
+    let di = d_transformed.(i) in
+    if Float.abs di > 1e-8 then begin
+      let base = i * dim in
+      for j = 0 to dim - 1 do
+        model.w.(base + j) <- model.w.(base + j) -. lr *. di *. state.(j)
+      done
+    end
+  done;
+  (* Also update drive from the logit gradient *)
+  let _ = transformed in
   Array.iteri (fun b sig_ ->
-    let eb = output_err.(b) in
-    if Float.abs eb > 1e-6 then
+    let dl = d_logits.(b) in
+    if Float.abs dl > 1e-6 then
       Array.iteri (fun j _ ->
-        sig_.(j) <- sig_.(j) -. lr *. eb *. (top.(j) +. top.(model.n_osc + j))
+        sig_.(j) <- sig_.(j) -. lr *. dl *.
+          (transformed.(j) +. transformed.(model.n_osc + j))
       ) sig_
-  ) model.drive;
-  (* Input direction: current token's drive adjusts from state error *)
-  let dr = model.drive.(token) in
-  Array.iteri (fun j _ ->
-    dr.(j) <- dr.(j) +. lr *. 0.01 *. top.(j)
-  ) dr
+  ) model.drive
 
-(** Process a full sequence. Returns average loss.
-
-    1. Map tokens to drives
-    2. FFT convolve through bank → states at every position
-    3. At each position: listen, compute loss, update drives *)
+(** Train on a sequence. Returns average loss. *)
 let train_sequence model tokens ~lr =
   let seq_len = Array.length tokens in
-
-  (* Step 1: token → drives *)
-  let drives = Array.map (strike model) tokens in
-
-  (* Step 2: FFT convolve → full causal states *)
+  let scaled_lr = lr /. Float.of_int seq_len in
+  let drives = Array.map (fun tok -> model.drive.(tok)) tokens in
   let states = Bank.encode model.oscillators drives in
-
-  (* Step 3: predict and learn at each position *)
   let total_loss = ref 0.0 in
   for t = 0 to seq_len - 2 do
     let state = states.(t) in
-    let target = tokens.(t + 1) in
-    let logits = listen model state in
+    let transformed = transform model state in
+    let logits = listen model transformed in
     let probs = softmax logits in
-    let loss = cross_entropy ~target probs in
-    total_loss := !total_loss +. loss;
-    let err = output_error ~target probs in
-    update_drives model ~token:tokens.(t) ~target ~output_err:err ~state ~lr
+    total_loss := !total_loss +. cross_entropy ~target:tokens.(t + 1) probs;
+    update_w model ~state ~transformed ~probs ~target:tokens.(t + 1) ~lr:scaled_lr
   done;
   !total_loss /. Float.of_int (seq_len - 1)
 
-(** Generate: given a seed sequence, predict next bytes *)
+(** Generate *)
 let generate model seed ~n_gen ~temperature =
   let context = Array.copy seed in
-  let generated = Buffer.create n_gen in
+  let buf = Buffer.create n_gen in
   for _ = 1 to n_gen do
-    let drives = Array.map (strike model) context in
+    let drives = Array.map (fun tok -> model.drive.(tok)) context in
     let states = Bank.encode model.oscillators drives in
     let state = states.(Array.length context - 1) in
-    let logits = listen model state in
+    let transformed = transform model state in
+    let logits = listen model transformed in
     let scaled = Array.map (fun l -> l /. temperature) logits in
     let probs = softmax scaled in
-    (* Sample *)
     let r = Random.float 1.0 in
     let next = ref 0 in
     let acc = ref 0.0 in
@@ -125,12 +147,10 @@ let generate model seed ~n_gen ~temperature =
       acc := !acc +. probs.(!next);
       if !acc < r then incr next
     done;
-    Buffer.add_char generated
+    Buffer.add_char buf
       (if !next >= 32 && !next < 127 then Char.chr !next else '.');
-    (* Shift context *)
-    let new_ctx = Array.init (Array.length context) (fun i ->
-      if i < Array.length context - 1 then context.(i + 1) else !next
-    ) in
-    Array.blit new_ctx 0 context 0 (Array.length context)
+    let n = Array.length context in
+    Array.blit context 1 context 0 (n - 1);
+    context.(n - 1) <- !next
   done;
-  Buffer.contents generated
+  Buffer.contents buf
