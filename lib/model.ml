@@ -1,23 +1,15 @@
-(** Text model — FFT bank → learned projection → readout.
+(** Text model — FFT bank → learned W → weight-tied readout.
 
-    tokens
-    |> drive forces
-    |> FFT convolve with h(t)    — oscillator physics
-    |> W × state                 — learned transformation
-    |> dot with drive signatures — weight-tied readout
-    |> softmax → next byte
-
-    The bank computes rich causal states (physics).
-    W transforms them into prediction-useful space (learning).
-    Drive signatures are used for both input and output (tying). *)
+    Optimized: accumulate gradients over the sequence,
+    update weights once at the end. Not 127 times. *)
 
 let vocab_size = 256
 
 type t = {
   oscillators : Oscillator.t array;
-  drive : float array array;   (** 256 × n_osc *)
-  w : float array;             (** state_dim × state_dim, flat row-major *)
-  mutable kernels : Bank.kernels;  (** precomputed FFT kernels *)
+  drive : float array array;
+  w : float array;
+  mutable kernels : Bank.kernels;
   n_osc : int;
   state_dim : int;
   seq_len : int;
@@ -34,26 +26,19 @@ let create n_osc seq_len =
     w = Array.init (state_dim * state_dim) (fun _ ->
       (Random.float 2.0 -. 1.0) *. scale);
     kernels = Bank.precompute_kernels oscillators seq_len;
-    n_osc;
-    state_dim;
-    seq_len;
+    n_osc; state_dim; seq_len;
   }
 
-(** Matrix-vector multiply: y = W × x (W is flat row-major) *)
-let mat_vec w ~rows ~cols x =
-  Array.init rows (fun i ->
+let transform model state =
+  let dim = model.state_dim in
+  Array.init dim (fun i ->
     let acc = ref 0.0 in
-    let base = i * cols in
-    for j = 0 to cols - 1 do
-      acc := !acc +. w.(base + j) *. x.(j)
+    let base = i * dim in
+    for j = 0 to dim - 1 do
+      acc := !acc +. model.w.(base + j) *. state.(j)
     done;
     !acc)
 
-(** Transform bank state through learned W *)
-let transform model state =
-  mat_vec model.w ~rows:model.state_dim ~cols:model.state_dim state
-
-(** State → logits: dot product of transformed state with drive signatures *)
 let listen model transformed =
   Array.map (fun sig_ ->
     let acc = ref 0.0 in
@@ -73,76 +58,84 @@ let softmax v =
 let cross_entropy ~target probs =
   -. log (Float.max 1e-10 probs.(target))
 
-(** Gradient of loss w.r.t. W.
-    d_loss/d_W = outer(d_loss/d_transformed, state)
-    d_loss/d_transformed = drive^T × (prob - one_hot)
-
-    Then W -= lr × gradient. Local, no global backward pass. *)
-let update_w model ~state ~transformed ~probs ~target ~lr =
-  let dim = model.state_dim in
-  (* d_loss/d_logits = prob - one_hot *)
-  let d_logits = Array.mapi (fun i p ->
-    p -. (if i = target then 1.0 else 0.0)) probs in
-  (* d_loss/d_transformed = drive^T × d_logits *)
-  let d_transformed = Array.init dim (fun j ->
-    let acc = ref 0.0 in
-    Array.iteri (fun b sig_ ->
-      let dl = d_logits.(b) in
-      if Float.abs dl > 1e-8 then begin
-        let s = sig_.(j mod model.n_osc) in
-        acc := !acc +. dl *. s
-      end
-    ) model.drive;
-    !acc
-  ) in
-  (* W -= lr × outer(d_transformed, state) *)
-  for i = 0 to dim - 1 do
-    let di = d_transformed.(i) in
-    if Float.abs di > 1e-8 then begin
-      let base = i * dim in
-      for j = 0 to dim - 1 do
-        model.w.(base + j) <- model.w.(base + j) -. lr *. di *. state.(j)
-      done
-    end
-  done;
-  (* Also update drive from the logit gradient *)
-  let _ = transformed in
-  Array.iteri (fun b sig_ ->
-    let dl = d_logits.(b) in
-    if Float.abs dl > 1e-6 then
-      Array.iteri (fun j _ ->
-        sig_.(j) <- sig_.(j) -. lr *. dl *.
-          (transformed.(j) +. transformed.(model.n_osc + j))
-      ) sig_
-  ) model.drive
-
-(** Train on a sequence. Returns average loss. *)
+(** Train: accumulate gradients over sequence, update once. *)
 let train_sequence model tokens ~lr =
   let seq_len = Array.length tokens in
-  let scaled_lr = lr /. Float.of_int seq_len in
+  let dim = model.state_dim in
+  let n_osc = model.n_osc in
+
   let drives = Array.map (fun tok -> model.drive.(tok)) tokens in
   let states = Bank.encode model.oscillators model.kernels drives in
+
+  (* Accumulate W gradient and drive gradient *)
+  let w_grad = Array.make (dim * dim) 0.0 in
+  let drive_grad = Array.init vocab_size (fun _ -> Array.make n_osc 0.0) in
   let total_loss = ref 0.0 in
+
   for t = 0 to seq_len - 2 do
     let state = states.(t) in
+    let target = tokens.(t + 1) in
     let transformed = transform model state in
     let logits = listen model transformed in
     let probs = softmax logits in
-    total_loss := !total_loss +. cross_entropy ~target:tokens.(t + 1) probs;
-    update_w model ~state ~transformed ~probs ~target:tokens.(t + 1) ~lr:scaled_lr
+    total_loss := !total_loss +. cross_entropy ~target probs;
+
+    (* d_loss/d_logits *)
+    let d_logits = Array.mapi (fun i p ->
+      p -. (if i = target then 1.0 else 0.0)) probs in
+
+    (* d_loss/d_transformed = drive^T × d_logits *)
+    let d_trans = Array.init dim (fun j ->
+      let acc = ref 0.0 in
+      for b = 0 to vocab_size - 1 do
+        let dl = d_logits.(b) in
+        if Float.abs dl > 1e-8 then
+          acc := !acc +. dl *. model.drive.(b).(j mod n_osc)
+      done;
+      !acc
+    ) in
+
+    (* Accumulate W gradient: outer(d_trans, state) *)
+    for i = 0 to dim - 1 do
+      let di = d_trans.(i) in
+      if Float.abs di > 1e-8 then begin
+        let base = i * dim in
+        for j = 0 to dim - 1 do
+          w_grad.(base + j) <- w_grad.(base + j) +. di *. state.(j)
+        done
+      end
+    done;
+
+    (* Accumulate drive gradient from output error *)
+    for b = 0 to vocab_size - 1 do
+      let dl = d_logits.(b) in
+      if Float.abs dl > 1e-6 then begin
+        let dg = drive_grad.(b) in
+        for j = 0 to n_osc - 1 do
+          dg.(j) <- dg.(j) +. dl *. (transformed.(j) +. transformed.(n_osc + j))
+        done
+      end
+    done
   done;
+
+  (* Single weight update *)
+  let scale = lr /. Float.of_int seq_len in
+  Array.iteri (fun i g -> model.w.(i) <- model.w.(i) -. scale *. g) w_grad;
+  Array.iteri (fun b dg ->
+    let sig_ = model.drive.(b) in
+    Array.iteri (fun j g -> sig_.(j) <- sig_.(j) -. scale *. g) dg
+  ) drive_grad;
+
   !total_loss /. Float.of_int (seq_len - 1)
 
-(** Generate *)
 let generate model seed ~n_gen ~temperature =
-  let context = Array.copy seed in
   let buf = Buffer.create n_gen in
+  let context = Array.copy seed in
   for _ = 1 to n_gen do
     let drives = Array.map (fun tok -> model.drive.(tok)) context in
     let states = Bank.encode model.oscillators model.kernels drives in
     let state = states.(Array.length context - 1) in
-    let transformed = transform model state in
-    let logits = listen model transformed in
+    let logits = listen model (transform model state) in
     let scaled = Array.map (fun l -> l /. temperature) logits in
     let probs = softmax scaled in
     let r = Random.float 1.0 in
