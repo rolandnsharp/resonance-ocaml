@@ -1,8 +1,7 @@
-(** Resonance — FFT oscillator bank + weight-tied readout.
+(** Resonance — FFT oscillator bank, batch-parallel training.
 
-    Clean. No dead layers. No settling. No pretending.
-    Just: tokens strike bells, FFT computes the ringing,
-    dot product listens for the next token. *)
+    Each step: N_BATCH sequences processed in parallel across CPU cores.
+    Gradients merged, weights updated once. *)
 
 let read_file path =
   let ic = open_in path in
@@ -25,10 +24,12 @@ let () =
   let n_osc   = env "N_OSC" 64 in
   let n_steps = env "N_STEPS" 10000 in
   let seq_len = env "SEQ_LEN" 128 in
+  let batch   = env "BATCH" (Resonance.Par.n_cores) in
   let lr      = env_f "LR" 0.01 in
 
-  Printf.printf "Resonance — FFT oscillator bank\n";
-  Printf.printf "Text: %d bytes | %d osc, seq=%d, lr=%g\n\n%!" text_len n_osc seq_len lr;
+  Printf.printf "Resonance — FFT oscillator bank (%d cores)\n" Resonance.Par.n_cores;
+  Printf.printf "Text: %d bytes | %d osc, seq=%d, batch=%d, lr=%g\n\n%!"
+    text_len n_osc seq_len batch lr;
 
   let model = Resonance.Model.create n_osc seq_len in
   let warmdown = n_steps / 5 in
@@ -41,10 +42,13 @@ let () =
       else 1.0 in
     let cur_lr = lr *. s in
 
-    let start = Random.int (text_len - seq_len - 1) in
-    let tokens = Array.init seq_len (fun i -> Char.code text.[start + i]) in
+    (* Batch of random sequences — one per core *)
+    let token_seqs = Array.init batch (fun _ ->
+      let start = Random.int (text_len - seq_len - 1) in
+      Array.init seq_len (fun i -> Char.code text.[start + i])
+    ) in
 
-    let loss = Resonance.Model.train_sequence model tokens ~lr:cur_lr in
+    let loss = Resonance.Model.train_batch model token_seqs ~lr:cur_lr in
 
     if step mod 100 = 0 then begin
       let bpc = loss /. log 2.0 in
