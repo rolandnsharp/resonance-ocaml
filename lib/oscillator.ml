@@ -1,12 +1,13 @@
 (** The one equation: H(ω) = 1 / (ω₀² - ω² + 2iγω)
 
-    Everything flows from this. Analysis, synthesis, coupling,
-    prediction, error — all are compositions of this transfer function. *)
+    Everything flows from this. A damped harmonic oscillator is a
+    function from driving force to response. Compose them and you
+    get a neural network. *)
 
 type complex = { re : float; im : float }
 
-let complex re im = { re; im }
 let c_zero = { re = 0.0; im = 0.0 }
+let c_one = { re = 1.0; im = 0.0 }
 let c_add a b = { re = a.re +. b.re; im = a.im +. b.im }
 let c_sub a b = { re = a.re -. b.re; im = a.im -. b.im }
 let c_mul a b = { re = a.re *. b.re -. a.im *. b.im;
@@ -17,51 +18,37 @@ let c_div a b =
   { re = (a.re *. b.re +. a.im *. b.im) /. d;
     im = (a.im *. b.re -. a.re *. b.im) /. d }
 let c_mag c = sqrt (c.re *. c.re +. c.im *. c.im)
-let c_conj c = { re = c.re; im = -. c.im }
 
-(** A single damped harmonic oscillator. Two parameters: frequency and damping. *)
+(** A single damped harmonic oscillator. *)
 type t = {
-  omega0 : float;   (** natural frequency (rad/s) *)
-  gamma  : float;    (** damping ratio (0 = undamped, 1 = critical) *)
+  omega0 : float;
+  gamma  : float;
 }
 
 let create ~omega0 ~gamma =
   { omega0; gamma = Float.max 0.01 (Float.min 0.99 gamma) }
 
-(** The transfer function. This is the entire model.
-    H(ω) = 1 / (ω₀² - ω² + 2iγω₀ω) *)
+(** The transfer function — the entire model in one expression. *)
 let transfer osc omega =
   let w0 = osc.omega0 in
   let g = osc.gamma in
-  let denom = complex
-    (w0 *. w0 -. omega *. omega)
-    (2.0 *. g *. w0 *. omega)
-  in
-  c_div (complex 1.0 0.0) denom
+  c_div c_one { re = w0 *. w0 -. omega *. omega;
+                im = 2.0 *. g *. w0 *. omega }
 
-(** Impulse response: h(t) = e^{-γω₀t} sin(ωd·t) / ωd
-    where ωd = ω₀√(1-γ²) is the damped frequency. *)
-let impulse_response osc t =
-  let w0 = osc.omega0 in
+(** Damped natural frequency *)
+let omega_d osc =
   let g = osc.gamma in
-  let wd = w0 *. sqrt (Float.max 1e-6 (1.0 -. g *. g)) in
-  let decay = exp (-. g *. w0 *. t) in
-  decay *. sin (wd *. t) /. wd
+  osc.omega0 *. sqrt (Float.max 1e-6 (1.0 -. g *. g))
 
-(** Analytical derivative of impulse response w.r.t. frequency.
-    dh/dω₀ — how the response changes when we tune the oscillator. *)
-let d_impulse_d_omega osc t =
-  let w0 = osc.omega0 in
-  let g = osc.gamma in
-  let wd = w0 *. sqrt (Float.max 1e-6 (1.0 -. g *. g)) in
-  let decay = exp (-. g *. w0 *. t) in
-  t *. decay *. cos (wd *. t) /. wd
+(** Impulse response: h(t) = e^{-γω₀t} sin(ωd·t) / ωd *)
+let impulse osc t =
+  let wd = omega_d osc in
+  exp (-. osc.gamma *. osc.omega0 *. t) *. sin (wd *. t) /. wd
 
-(** Analytical derivative w.r.t. damping.
-    dh/dγ — how the response changes when we adjust damping. *)
-let d_impulse_d_gamma osc t =
-  let w0 = osc.omega0 in
+(** Velocity impulse response *)
+let impulse_vel osc t =
   let g = osc.gamma in
-  let wd = w0 *. sqrt (Float.max 1e-6 (1.0 -. g *. g)) in
+  let w0 = osc.omega0 in
+  let wd = omega_d osc in
   let decay = exp (-. g *. w0 *. t) in
-  -. t *. decay *. sin (wd *. t) /. wd
+  decay *. (cos (wd *. t) -. (g *. w0 /. wd) *. sin (wd *. t))
