@@ -57,7 +57,7 @@ let sample ~temperature logits =
 type t = {
   oscillators : Oscillator.t array;
   drive : float array array;
-  w : float array;
+  prism : Prism.t;              (** structured transform: couple → shuffle → ... *)
   mutable kernels : Bank.kernels;
   n_osc : int;
   state_dim : int;
@@ -72,7 +72,7 @@ let create n_osc seq_len =
   {
     oscillators;
     drive = Array.init vocab_size (fun _ -> Array.init n_osc (fun _ -> rand ()));
-    w = Array.init (state_dim * state_dim) (fun _ -> rand ());
+    prism = Prism.create state_dim;
     kernels = Bank.precompute_kernels oscillators seq_len;
     n_osc; state_dim; seq_len;
   }
@@ -87,9 +87,9 @@ let resonate model tokens =
   let drives = Array.map (strike model) tokens in
   Bank.encode model.oscillators model.kernels drives
 
-(** Transform: project bank state through learned W *)
+(** Transform: bank state through prism (composed oscillator-shuffle layers) *)
 let transform model state =
-  mat_vec model.w ~rows:model.state_dim ~cols:model.state_dim state
+  Prism.forward model.prism state
 
 (** Listen: dot product of [pos + vel] with each drive signature *)
 let listen model transformed =
@@ -124,10 +124,6 @@ let listen_backward model d_logits =
     ) model.drive;
     !acc)
 
-(** Update W: gradient descent on W from one position's error *)
-let update_w model state d_transformed ~lr =
-  outer_update model.w ~cols:model.state_dim d_transformed state ~scale:(-.lr)
-
 (** Update drives: adjust each byte's signature from logit gradient *)
 let update_drives model transformed d_logits ~lr =
   let n = model.n_osc in
@@ -139,14 +135,15 @@ let update_drives model transformed d_logits ~lr =
       ) sig_
   ) model.drive
 
-(** Learn from one position: forward → loss → backward → update *)
+(** Learn from one position: forward → loss → backward through prism → update *)
 let learn_position model ~state ~target ~lr =
   let transformed = transform model state in
   let probs = predict model state in
   let loss = cross_entropy ~target probs in
   let d_logits = logit_gradient ~target probs in
   let d_transformed = listen_backward model d_logits in
-  update_w model state d_transformed ~lr;
+  (* Backward through prism: updates prism params, returns d_state *)
+  let _d_state = Prism.backward model.prism state d_transformed ~lr in
   update_drives model transformed d_logits ~lr;
   loss
 
