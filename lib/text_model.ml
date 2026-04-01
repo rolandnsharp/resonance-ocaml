@@ -52,7 +52,7 @@ let logits model =
 let train_token model ~token ~target ~settle_iters ~activity_lr ~weight_lr =
   (* 1. Strike *)
   let force = model.drive.(token) in
-  model.state <- Bank.strike model.bank ~decay:0.95 ~dt:0.01 model.state force;
+  model.state <- Bank.strike model.bank model.state force;
 
   (* 2. Settle *)
   let st = model.state in
@@ -122,7 +122,7 @@ let train_token model ~token ~target ~settle_iters ~activity_lr ~weight_lr =
 (** Inference: strike, settle, listen *)
 let infer model token =
   let force = model.drive.(token) in
-  model.state <- Bank.strike model.bank ~decay:0.95 ~dt:0.01 model.state force;
+  model.state <- Bank.strike model.bank model.state force;
   let st = model.state in
   let pc = ref model.pc in
   for _ = 1 to 3 do

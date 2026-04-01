@@ -52,3 +52,22 @@ let impulse_vel osc t =
   let wd = omega_d osc in
   let decay = exp (-. g *. w0 *. t) in
   decay *. (cos (wd *. t) -. (g *. w0 /. wd) *. sin (wd *. t))
+
+(** Exact discrete-time ODE step.
+    Given (pos, vel) and impulse force, returns (pos', vel') after dt.
+    Each oscillator decays at its own natural rate — no artificial decay. *)
+let step osc ~dt ~force (pos, vel) =
+  let alpha = osc.gamma *. osc.omega0 in
+  let wd = omega_d osc in
+  let decay = exp (-. alpha *. dt) in
+  let cos_t = cos (wd *. dt) in
+  let sin_t = sin (wd *. dt) in
+  let wd_safe = Float.max 1e-8 wd in
+  (* Homogeneous: free ringing from current state *)
+  let h_pos = decay *. (pos *. cos_t +. (vel +. alpha *. pos) /. wd_safe *. sin_t) in
+  let h_vel = decay *. (vel *. cos_t
+    -. (pos *. wd_safe +. alpha *. (vel +. alpha *. pos) /. wd_safe) *. sin_t) in
+  (* Particular: impulse response to force *)
+  let p_pos = force *. decay *. sin_t /. wd_safe in
+  let p_vel = force *. decay *. (cos_t -. alpha /. wd_safe *. sin_t) in
+  (h_pos +. p_pos, h_vel +. p_vel)

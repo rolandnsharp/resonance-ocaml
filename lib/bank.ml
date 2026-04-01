@@ -1,15 +1,13 @@
-(** A bank of oscillators.
+(** A bank of oscillators — each one rings at its own frequency.
 
-    Token arrives → bank rings → state emerges.
-
-    The bank is a function: force vector → state vector.
-    Each oscillator independently transforms its component of the force
-    into [position, velocity]. The collection of all oscillator states
-    IS the representation. *)
+    Low frequency, low damping → rings for hundreds of bytes (sentence context)
+    High frequency, high damping → rings briefly (character detail)
+    The physics gives us multi-scale context for free. *)
 
 type t = {
   oscillators : Oscillator.t array;
   n : int;
+  dt : float;
 }
 
 let create n =
@@ -19,27 +17,20 @@ let create n =
     let gamma = 0.05 +. 0.15 *. f in
     Oscillator.create ~omega0 ~gamma
   ) in
-  { oscillators = osc; n }
+  { oscillators = osc; n; dt = 1.0 }
 
-(** Strike the bank: apply force vector, return new state.
-    Pure function — takes old state, returns new state. No mutation.
-
-    state = [pos_0, pos_1, ..., vel_0, vel_1, ...]
-    Each oscillator: pos' = decay * pos + force * h(dt)
-                     vel' = decay * vel + force              *)
-let strike bank ~decay ~dt (state : Vec.t) (force : Vec.t) : Vec.t =
+(** Strike: exact ODE step per oscillator.
+    No crude decay — each oscillator decays at its own natural rate. *)
+let strike bank (state : Vec.t) (force : Vec.t) : Vec.t =
   let n = bank.n in
   Vec.create (2 * n) (fun k ->
     let i = k mod n in
     let osc = bank.oscillators.(i) in
+    let pos = state.(i) in
+    let vel = state.(n + i) in
     let f = force.(i) in
-    if k < n then
-      (* position *)
-      decay *. state.(k) +. f *. Oscillator.impulse osc dt
-    else
-      (* velocity *)
-      decay *. state.(k) +. f *. Oscillator.impulse_vel osc dt
+    let pos', vel' = Oscillator.step osc ~dt:bank.dt ~force:f (pos, vel) in
+    if k < n then pos' else vel'
   )
 
-(** Zero state *)
 let zero_state bank = Vec.zeros (2 * bank.n)
