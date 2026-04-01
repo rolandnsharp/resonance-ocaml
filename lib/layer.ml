@@ -40,6 +40,12 @@ let outer_accum grad a b ~cols ~scale =
 
 let sigmoid x = 1.0 /. (1.0 +. exp (-. x))
 
+(** Clip vector to max norm *)
+let clip_norm max_norm v =
+  let norm = sqrt (Array.fold_left (fun acc x -> acc +. x *. x) 0.0 v) in
+  if norm > max_norm then Array.map (fun x -> x *. max_norm /. norm) v
+  else v
+
 let gelu x =
   0.5 *. x *. (1.0 +. tanh (0.7978846 *. (x +. 0.044715 *. x *. x *. x)))
 
@@ -183,32 +189,40 @@ let gate_backward layer cache d_gated ~lr =
   (* d_normed1 from gate = d_gated × gate_val *)
   Array.map2 (fun dg gv -> dg *. gv) d_gated cache.gate_val
 
+(** RMSNorm backward: d_input from d_output and cached input *)
+let rms_norm_backward x d_output =
+  let n = Float.of_int (Array.length x) in
+  let rms = sqrt (Array.fold_left (fun acc xi -> acc +. xi *. xi) 0.0 x /. n +. 1e-8) in
+  let inv_rms = 1.0 /. rms in
+  let dot = Array.fold_left (fun acc i ->
+    acc +. d_output.(i) *. x.(i)
+  ) 0.0 (Array.init (Array.length x) Fun.id) in
+  Array.init (Array.length x) (fun i ->
+    inv_rms *. (d_output.(i) -. x.(i) *. dot /. (rms *. rms *. n))
+  )
+
 (** Full layer backward: returns d_input for previous layer *)
 let backward layer cache d_output ~lr =
-  (* Through FFN residual: gradient flows to both FFN and after_wf *)
-  let d_ffn = d_output in
-  let d_after_wf_from_ffn = d_output in
+  (* Through FFN residual *)
+  let d_normed2 = ffn_backward layer cache d_output ~lr in
+  let d_after_wf = Array.map2 ( +. ) d_output
+    (rms_norm_backward cache.after_wf d_normed2) in
 
-  (* Backprop through FFN *)
-  let d_normed2 = ffn_backward layer cache d_ffn ~lr in
-  (* RMSNorm backward (approximate: just pass through scaled) *)
-  let d_after_wf = Array.map2 ( +. ) d_after_wf_from_ffn d_normed2 in
-
-  (* Through wave-field residual *)
-  let d_bank = d_after_wf in
-  let d_input_from_wf = d_after_wf in
-
-  (* Approximate: gradient through bank → gate.
-     Full FFT backward would be another FFT, but for now pass gradient through *)
+  (* Through wave-field residual — approximate FFT backward *)
   let d_gated = Array.init layer.dim (fun i ->
-    d_bank.(i mod (2 * layer.n_osc))
+    d_after_wf.(i mod (2 * layer.n_osc))
   ) in
-
-  (* Backprop through gate *)
   let d_normed1 = gate_backward layer cache d_gated ~lr in
+  let d_input = Array.map2 ( +. ) d_after_wf
+    (rms_norm_backward cache.input d_normed1) in
 
-  (* Combine: d_input from residual + d_input from wave_field path *)
-  Array.map2 ( +. ) d_input_from_wf d_normed1
+  (* Weight decay: prevent weights from growing *)
+  let decay = 0.999 in
+  Array.iteri (fun i w -> layer.w_gate.(i) <- w *. decay) layer.w_gate;
+  Array.iteri (fun i w -> layer.w_up.(i) <- w *. decay) layer.w_up;
+  Array.iteri (fun i w -> layer.w_down.(i) <- w *. decay) layer.w_down;
+
+  d_input
 
 (** Forward + backward for full sequence. Returns (outputs, d_inputs) *)
 let train layer states d_outputs ~lr =
