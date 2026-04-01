@@ -33,10 +33,10 @@ let () =
   Printf.printf "Bank: %d oscillators, %d PC layers\n" n_osc n_layers;
   Printf.printf "No backprop. Local errors only.\n\n";
 
-  let n_steps = 10000 in
-  let seq_len = 64 in
-  let settle = 5 in
-  let lr = 0.001 in
+  let n_steps = int_of_string (try Sys.getenv "N_STEPS" with _ -> "50000") in
+  let seq_len = int_of_string (try Sys.getenv "SEQ_LEN" with _ -> "64") in
+  let settle = int_of_string (try Sys.getenv "SETTLE" with _ -> "3") in
+  let lr = float_of_string (try Sys.getenv "LR" with _ -> "0.001") in
   let text_len = String.length text in
 
   for step = 0 to n_steps - 1 do

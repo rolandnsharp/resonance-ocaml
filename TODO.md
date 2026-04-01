@@ -5,9 +5,11 @@
 - [x] Oscillator bank (analysis via impulse response convolution)
 - [x] Predictive coding layer (local errors, Hebbian updates)
 - [x] Basic network (multi-layer, settle + learn)
-- [ ] Character-level text encoding (char → oscillator states)
-- [ ] Text prediction loop (predict next char from oscillator states)
-- [ ] Shakespeare training + generation
+- [x] Byte-level encoding (byte → drive force → strike bank)
+- [x] Text prediction (oscillator states → PC layers → next byte)
+- [x] Shakespeare training (loss 5.54 → 4.37, no backprop, CPU)
+- [ ] Shakespeare coherent generation (need more training / tuning)
+- [ ] Profile and optimize hot path (matrix ops, settle loop)
 
 ## Soon
 - [ ] OCaml 5 for parallel (Eio structured concurrency)
