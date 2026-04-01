@@ -48,7 +48,9 @@ let () =
       Array.init seq_len (fun i -> Char.code text.[start + i])
     ) in
 
-    let loss = Resonance.Model.train_batch model token_seqs ~lr:cur_lr in
+    let loss = Array.fold_left (fun acc seq ->
+      acc +. Resonance.Model.train_sequence model seq ~lr:cur_lr
+    ) 0.0 token_seqs /. Float.of_int batch in
 
     if step mod 100 = 0 then begin
       let bpc = loss /. log 2.0 in
