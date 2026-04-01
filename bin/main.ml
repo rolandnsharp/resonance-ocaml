@@ -1,8 +1,9 @@
-(** Resonance — bytes strike bells, predictive coding learns.
+(** Resonance — continuous stream, never reset.
 
-    No backprop. No GPU. No tokenizer.
-    Each byte is a hammer. Each oscillator is a bell.
-    The ringing is the understanding. *)
+    The oscillators ring from the first byte to the last.
+    The PC layers accumulate context like memory.
+    Decay is the only forgetting.
+    Strike and listen are the same resonance. *)
 
 let read_file path =
   let ic = open_in path in
@@ -12,87 +13,77 @@ let read_file path =
   close_in ic;
   Bytes.to_string s
 
+let env_int name default =
+  int_of_string (try Sys.getenv name with _ -> string_of_int default)
+let env_float name default =
+  float_of_string (try Sys.getenv name with _ -> Printf.sprintf "%g" default)
+
 let () =
   Random.self_init ();
-  Printf.printf "Resonance — bytes strike bells\n\n";
-
   let text_path = if Array.length Sys.argv > 1 then Sys.argv.(1)
     else "data/shakespeare.txt" in
-  let text =
-    if Sys.file_exists text_path then read_file text_path
-    else (Printf.printf "Using built-in text\n";
-      "To be, or not to be, that is the question: \
-       Whether tis nobler in the mind to suffer \
-       The slings and arrows of outrageous fortune.")
-  in
-  Printf.printf "Text: %d bytes\n" (String.length text);
+  let text = if Sys.file_exists text_path then read_file text_path
+    else "To be, or not to be, that is the question." in
 
-  let n_osc = int_of_string (try Sys.getenv "N_OSC" with _ -> "32") in
-  let n_layers = int_of_string (try Sys.getenv "N_LAYERS" with _ -> "2") in
-  let model = Resonance.Text_model.create ~n_osc ~n_layers in
-  Printf.printf "Bank: %d oscillators, %d PC layers\n" n_osc n_layers;
-  Printf.printf "No backprop. Local errors only.\n\n";
-
-  let n_steps = int_of_string (try Sys.getenv "N_STEPS" with _ -> "50000") in
-  let seq_len = int_of_string (try Sys.getenv "SEQ_LEN" with _ -> "64") in
-  let settle = int_of_string (try Sys.getenv "SETTLE" with _ -> "3") in
-  let lr = float_of_string (try Sys.getenv "LR" with _ -> "0.001") in
+  let n_osc    = env_int   "N_OSC"    32 in
+  let n_layers = env_int   "N_LAYERS" 2 in
+  let n_steps  = env_int   "N_STEPS"  50000 in
+  let settle   = env_int   "SETTLE"   3 in
+  let lr       = env_float "LR"       0.001 in
   let text_len = String.length text in
 
+  Printf.printf "Resonance — continuous stream, strike and listen\n";
+  Printf.printf "Text: %d bytes | %d osc, %d layers, settle=%d\n"
+    text_len n_osc n_layers settle;
+  Printf.printf "LR: %g | No reset. Oscillators ring forever.\n\n%!" lr;
+
+  let model = Resonance.Text_model.create ~n_osc ~n_layers in
   let warmdown_start = n_steps - n_steps / 5 in
 
+  let pos = ref 0 in
+  let loss_sum = ref 0.0 in
+  let loss_count = ref 0 in
+
   for step = 0 to n_steps - 1 do
-    (* LR schedule: warmup 200 steps, constant, cosine warmdown last 20% *)
     let lr_scale =
-      if step < 200 then Float.of_int step /. 200.0
+      if step < 500 then Float.of_int step /. 500.0
       else if step >= warmdown_start then
-        let progress = Float.of_int (step - warmdown_start)
+        let p = Float.of_int (step - warmdown_start)
           /. Float.of_int (n_steps - warmdown_start) in
-        0.5 *. (1.0 +. cos (Float.pi *. progress))
-      else 1.0
-    in
+        0.5 *. (1.0 +. cos (Float.pi *. p))
+      else 1.0 in
     let cur_lr = lr *. lr_scale in
 
-    let start = Random.int (text_len - seq_len - 1) in
-    Resonance.Text_model.reset model;
+    let token = Char.code text.[!pos] in
+    let target = Char.code text.[(!pos + 1) mod text_len] in
 
-    let total_loss = ref 0.0 in
-    let count = ref 0 in
+    let loss = Resonance.Text_model.train_token model ~token ~target
+      ~settle_iters:settle
+      ~activity_lr:0.01
+      ~weight_lr:cur_lr in
 
-    for i = 0 to seq_len - 2 do
-      let token = Char.code text.[start + i] in
-      let target = Char.code text.[start + i + 1] in
+    loss_sum := !loss_sum +. loss;
+    incr loss_count;
+    pos := (!pos + 1) mod text_len;
 
-      let logits = Resonance.Text_model.forward model token ~settle_steps:settle in
-      total_loss := !total_loss +. Resonance.Vec.cross_entropy ~target (Resonance.Vec.softmax logits);
-      incr count;
-
-      Resonance.Text_model.learn model ~target ~logits ~lr:cur_lr
-    done;
-
-    if step mod 200 = 0 then begin
-      let avg = !total_loss /. Float.of_int !count in
+    if step mod 1000 = 0 then begin
+      let avg = !loss_sum /. Float.of_int !loss_count in
       let bpc = avg /. log 2.0 in
-      Printf.printf "step %5d  loss %.3f  bpc %.3f  lr %.1e" step avg bpc cur_lr;
+      Printf.printf "step %5d  loss %.3f  bpc %.3f  lr %.1e  pos %d" step avg bpc cur_lr !pos;
+      loss_sum := 0.0; loss_count := 0;
 
-      if step mod 1000 = 0 then begin
-        Resonance.Text_model.reset model;
-        let seed = "The " in
-        String.iter (fun c ->
-          ignore (Resonance.Text_model.forward model (Char.code c) ~settle_steps:settle)
-        ) seed;
-        Printf.printf "  | The ";
-        let last = ref (Char.code 'e') in
-        for _ = 1 to 80 do
-          let logits = Resonance.Text_model.forward model !last ~settle_steps:settle in
-          let next = Resonance.Vec.sample ~temperature:0.8 logits in
+      if step mod 5000 = 0 then begin
+        Printf.printf "  | ";
+        let last = ref token in
+        for _ = 1 to 60 do
+          let l = Resonance.Text_model.infer model !last in
+          let next = Resonance.Vec.sample ~temperature:0.8 l in
           last := next;
-          let c = if next >= 32 && next < 127 then Char.chr next else '.' in
-          Printf.printf "%c" c;
-        done;
+          Printf.printf "%c"
+            (if next >= 32 && next < 127 then Char.chr next else '.')
+        done
       end;
       Printf.printf "\n%!"
     end
   done;
-
   Printf.printf "\nDone.\n"
