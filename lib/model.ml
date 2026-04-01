@@ -1,23 +1,64 @@
-(** Text model — FFT bank → learned projection → readout.
+(** Text model — the pipeline.
 
-    tokens
-    |> drive forces
-    |> FFT convolve with h(t)    — oscillator physics
-    |> W × state                 — learned transformation
-    |> dot with drive signatures — weight-tied readout
-    |> softmax → next byte
+    tokens |> strike |> resonate |> transform |> listen |> predict
 
-    The bank computes rich causal states (physics).
-    W transforms them into prediction-useful space (learning).
-    Drive signatures are used for both input and output (tying). *)
+    Three components:
+      drive — byte → oscillator force (strike) and comparison (listen)
+      W     — learned projection from bank state to prediction space
+      bank  — oscillator impulse responses, FFT convolved (physics) *)
 
 let vocab_size = 256
 
+(* --- Linear algebra primitives --- *)
+
+(** Flat row-major matrix × vector *)
+let mat_vec w ~rows ~cols x =
+  Array.init rows (fun i ->
+    let acc = ref 0.0 in
+    let base = i * cols in
+    for j = 0 to cols - 1 do
+      acc := !acc +. w.(base + j) *. x.(j)
+    done; !acc)
+
+(** Sparse outer product update: W += scale × a ⊗ b (skips small a_i) *)
+let outer_update w ~cols a b ~scale =
+  Array.iteri (fun i ai ->
+    if Float.abs ai > 1e-8 then
+      let base = i * cols in
+      Array.iteri (fun j bj ->
+        w.(base + j) <- w.(base + j) +. scale *. ai *. bj
+      ) b
+  ) a
+
+(* --- Probability --- *)
+
+let softmax v =
+  let mx = Array.fold_left Float.max neg_infinity v in
+  let exps = Array.map (fun l -> exp (l -. mx)) v in
+  let sum = Array.fold_left ( +. ) 0.0 exps in
+  Array.map (fun e -> e /. sum) exps
+
+let cross_entropy ~target probs =
+  -. log (Float.max 1e-10 probs.(target))
+
+let logit_gradient ~target probs =
+  Array.mapi (fun i p -> p -. (if i = target then 1.0 else 0.0)) probs
+
+let sample ~temperature logits =
+  let probs = Array.map (fun l -> l /. temperature) logits |> softmax in
+  let r = Random.float 1.0 in
+  let i = ref 0 and acc = ref 0.0 in
+  while !acc < r && !i < Array.length probs - 1 do
+    acc := !acc +. probs.(!i); if !acc < r then incr i
+  done; !i
+
+(* --- Model --- *)
+
 type t = {
   oscillators : Oscillator.t array;
-  drive : float array array;   (** 256 × n_osc *)
-  w : float array;             (** state_dim × state_dim, flat row-major *)
-  mutable kernels : Bank.kernels;  (** precomputed FFT kernels *)
+  drive : float array array;
+  w : float array;
+  mutable kernels : Bank.kernels;
   n_osc : int;
   state_dim : int;
   seq_len : int;
@@ -26,136 +67,122 @@ type t = {
 let create n_osc seq_len =
   let state_dim = 2 * n_osc in
   let scale = 1.0 /. sqrt (Float.of_int state_dim) in
+  let rand () = (Random.float 2.0 -. 1.0) *. scale in
   let oscillators = Oscillator.spread n_osc in
   {
     oscillators;
-    drive = Array.init vocab_size (fun _ ->
-      Array.init n_osc (fun _ -> (Random.float 2.0 -. 1.0) *. scale));
-    w = Array.init (state_dim * state_dim) (fun _ ->
-      (Random.float 2.0 -. 1.0) *. scale);
+    drive = Array.init vocab_size (fun _ -> Array.init n_osc (fun _ -> rand ()));
+    w = Array.init (state_dim * state_dim) (fun _ -> rand ());
     kernels = Bank.precompute_kernels oscillators seq_len;
-    n_osc;
-    state_dim;
-    seq_len;
+    n_osc; state_dim; seq_len;
   }
 
-(** Matrix-vector multiply: y = W × x (W is flat row-major) *)
-let mat_vec w ~rows ~cols x =
-  Array.init rows (fun i ->
-    let acc = ref 0.0 in
-    let base = i * cols in
-    for j = 0 to cols - 1 do
-      acc := !acc +. w.(base + j) *. x.(j)
-    done;
-    !acc)
+(* --- Pipeline: strike → resonate → transform → listen → predict --- *)
 
-(** Transform bank state through learned W *)
+(** Strike: byte selects a drive signature *)
+let strike model token = model.drive.(token)
+
+(** Resonate: FFT convolve drives with oscillator impulse responses *)
+let resonate model tokens =
+  let drives = Array.map (strike model) tokens in
+  Bank.encode model.oscillators model.kernels drives
+
+(** Transform: project bank state through learned W *)
 let transform model state =
   mat_vec model.w ~rows:model.state_dim ~cols:model.state_dim state
 
-(** State → logits: dot product of transformed state with drive signatures *)
+(** Listen: dot product of [pos + vel] with each drive signature *)
 let listen model transformed =
+  let n = model.n_osc in
   Array.map (fun sig_ ->
     let acc = ref 0.0 in
-    for i = 0 to model.n_osc - 1 do
-      acc := !acc +. transformed.(i) *. sig_.(i)
-               +. transformed.(model.n_osc + i) *. sig_.(i)
-    done;
-    !acc
+    for i = 0 to n - 1 do
+      acc := !acc +. sig_.(i) *. (transformed.(i) +. transformed.(n + i))
+    done; !acc
   ) model.drive
 
-let softmax v =
-  let mx = Array.fold_left Float.max neg_infinity v in
-  let exps = Array.map (fun l -> exp (l -. mx)) v in
-  let s = Array.fold_left ( +. ) 0.0 exps in
-  Array.map (fun e -> e /. s) exps
+(** Forward: state → logits *)
+let forward model state =
+  state |> transform model |> listen model
 
-let cross_entropy ~target probs =
-  -. log (Float.max 1e-10 probs.(target))
+(** Predict: state → probability distribution *)
+let predict model state =
+  state |> forward model |> softmax
 
-(** Gradient of loss w.r.t. W.
-    d_loss/d_W = outer(d_loss/d_transformed, state)
-    d_loss/d_transformed = drive^T × (prob - one_hot)
+(* --- Gradient computation --- *)
 
-    Then W -= lr × gradient. Local, no global backward pass. *)
-let update_w model ~state ~transformed ~probs ~target ~lr =
-  let dim = model.state_dim in
-  (* d_loss/d_logits = prob - one_hot *)
-  let d_logits = Array.mapi (fun i p ->
-    p -. (if i = target then 1.0 else 0.0)) probs in
-  (* d_loss/d_transformed = drive^T × d_logits *)
-  let d_transformed = Array.init dim (fun j ->
+(** Backprop through listen: drive^T × d_logits → d_transformed.
+    Sparse: only bytes with significant gradient contribute. *)
+let listen_backward model d_logits =
+  let dim = model.state_dim and n = model.n_osc in
+  Array.init dim (fun j ->
     let acc = ref 0.0 in
     Array.iteri (fun b sig_ ->
       let dl = d_logits.(b) in
-      if Float.abs dl > 1e-8 then begin
-        let s = sig_.(j mod model.n_osc) in
-        acc := !acc +. dl *. s
-      end
+      if Float.abs dl > 1e-8 then
+        acc := !acc +. dl *. sig_.(j mod n)
     ) model.drive;
-    !acc
-  ) in
-  (* W -= lr × outer(d_transformed, state) *)
-  for i = 0 to dim - 1 do
-    let di = d_transformed.(i) in
-    if Float.abs di > 1e-8 then begin
-      let base = i * dim in
-      for j = 0 to dim - 1 do
-        model.w.(base + j) <- model.w.(base + j) -. lr *. di *. state.(j)
-      done
-    end
-  done;
-  (* Also update drive from the logit gradient *)
-  let _ = transformed in
+    !acc)
+
+(** Update W: gradient descent on W from one position's error *)
+let update_w model state d_transformed ~lr =
+  outer_update model.w ~cols:model.state_dim d_transformed state ~scale:(-.lr)
+
+(** Update drives: adjust each byte's signature from logit gradient *)
+let update_drives model transformed d_logits ~lr =
+  let n = model.n_osc in
   Array.iteri (fun b sig_ ->
     let dl = d_logits.(b) in
     if Float.abs dl > 1e-6 then
       Array.iteri (fun j _ ->
-        sig_.(j) <- sig_.(j) -. lr *. dl *.
-          (transformed.(j) +. transformed.(model.n_osc + j))
+        sig_.(j) <- sig_.(j) -. lr *. dl *. (transformed.(j) +. transformed.(n + j))
       ) sig_
   ) model.drive
 
-(** Train on a sequence. Returns average loss. *)
+(** Learn from one position: forward → loss → backward → update *)
+let learn_position model ~state ~target ~lr =
+  let transformed = transform model state in
+  let probs = predict model state in
+  let loss = cross_entropy ~target probs in
+  let d_logits = logit_gradient ~target probs in
+  let d_transformed = listen_backward model d_logits in
+  update_w model state d_transformed ~lr;
+  update_drives model transformed d_logits ~lr;
+  loss
+
+(* --- Training --- *)
+
+(** Train on a token sequence: resonate → learn at each position *)
 let train_sequence model tokens ~lr =
   let seq_len = Array.length tokens in
-  let scaled_lr = lr /. Float.of_int seq_len in
-  let drives = Array.map (fun tok -> model.drive.(tok)) tokens in
-  let states = Bank.encode model.oscillators model.kernels drives in
+  let lr_scaled = lr /. Float.of_int seq_len in
+  let states = resonate model tokens in
   let total_loss = ref 0.0 in
   for t = 0 to seq_len - 2 do
-    let state = states.(t) in
-    let transformed = transform model state in
-    let logits = listen model transformed in
-    let probs = softmax logits in
-    total_loss := !total_loss +. cross_entropy ~target:tokens.(t + 1) probs;
-    update_w model ~state ~transformed ~probs ~target:tokens.(t + 1) ~lr:scaled_lr
+    let loss = learn_position model
+      ~state:states.(t) ~target:tokens.(t + 1) ~lr:lr_scaled in
+    total_loss := !total_loss +. loss
   done;
   !total_loss /. Float.of_int (seq_len - 1)
 
-(** Generate *)
+(* --- Generation --- *)
+
+(** Shift context window: drop oldest, append new *)
+let shift_context context next =
+  let n = Array.length context in
+  Array.blit context 1 context 0 (n - 1);
+  context.(n - 1) <- next
+
+(** Generate text from a seed *)
 let generate model seed ~n_gen ~temperature =
   let context = Array.copy seed in
   let buf = Buffer.create n_gen in
   for _ = 1 to n_gen do
-    let drives = Array.map (fun tok -> model.drive.(tok)) context in
-    let states = Bank.encode model.oscillators model.kernels drives in
-    let state = states.(Array.length context - 1) in
-    let transformed = transform model state in
-    let logits = listen model transformed in
-    let scaled = Array.map (fun l -> l /. temperature) logits in
-    let probs = softmax scaled in
-    let r = Random.float 1.0 in
-    let next = ref 0 in
-    let acc = ref 0.0 in
-    while !acc < r && !next < vocab_size - 1 do
-      acc := !acc +. probs.(!next);
-      if !acc < r then incr next
-    done;
+    let states = resonate model context in
+    let logits = forward model states.(Array.length context - 1) in
+    let next = sample ~temperature logits in
     Buffer.add_char buf
-      (if !next >= 32 && !next < 127 then Char.chr !next else '.');
-    let n = Array.length context in
-    Array.blit context 1 context 0 (n - 1);
-    context.(n - 1) <- !next
+      (if next >= 32 && next < 127 then Char.chr next else '.');
+    shift_context context next
   done;
   Buffer.contents buf
