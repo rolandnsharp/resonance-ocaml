@@ -45,8 +45,9 @@ let () =
   let loss_count = ref 0 in
 
   for step = 0 to n_steps - 1 do
+    let warmup_steps = Int.min 500 (n_steps / 20) in
     let lr_scale =
-      if step < 500 then Float.of_int step /. 500.0
+      if step < warmup_steps then Float.of_int step /. Float.of_int warmup_steps
       else if step >= warmdown_start then
         let p = Float.of_int (step - warmdown_start)
           /. Float.of_int (n_steps - warmdown_start) in

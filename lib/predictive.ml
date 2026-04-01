@@ -63,17 +63,20 @@ let resonate ~omega ~gamma ~source_omega n_osc (input : Vec.t) : Vec.t =
   )
 
 (** Full prediction: dendrite → resonate → axon
-    pred = C × resonate(A, B × input) *)
+    pred = C × resonate(A, B × input)
+    Set USE_RESONANCE=0 to bypass A and test B→C directly *)
+let use_resonance = try int_of_string (Sys.getenv "USE_RESONANCE") <> 0 with _ -> true
+
 let predict coupling input =
   let n = coupling.n_osc in
-  (* Dendrite: project input into oscillator space *)
   let projected = Vec.mat_t_vec coupling.b input in
-  (* Resonate: complex coupling through transfer function *)
-  let resonated = resonate
-    ~omega:coupling.omega ~gamma:coupling.gamma
-    ~source_omega:coupling.source_omega n projected in
-  (* Axon: project back to output space *)
-  Vec.mat_t_vec coupling.c resonated
+  let through_a =
+    if use_resonance then
+      resonate ~omega:coupling.omega ~gamma:coupling.gamma
+        ~source_omega:coupling.source_omega n projected
+    else projected  (* bypass — just B → C *)
+  in
+  Vec.mat_t_vec coupling.c through_a
 
 (** Backward: propagate error through axon → resonate → dendrite *)
 let propagate_error coupling err =

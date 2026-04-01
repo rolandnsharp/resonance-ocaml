@@ -82,11 +82,19 @@ let inject_top_error m top_err ~lr =
   };
   m.pc <- { m.pc with layers }
 
-(** Settle PC layers with weight updates (learning phase) *)
+(** Settle PC layers with weight updates (learning phase).
+    Preserves injected top error by adding it back after each step. *)
 let settle_and_learn m ~iters ~activity_lr ~weight_lr =
   let input = m.state in
+  let top_idx = m.pc.n_layers - 1 in
+  let saved_top_err = m.pc.layers.(top_idx).Predictive.error in
   for _ = 1 to iters do
-    m.pc <- Predictive.step ~activity_lr ~weight_lr input m.pc
+    m.pc <- Predictive.step ~activity_lr ~weight_lr input m.pc;
+    (* Add back the output error — don't let PC overwrite it *)
+    let layers = Array.copy m.pc.layers in
+    layers.(top_idx) <- { layers.(top_idx) with
+      Predictive.error = Vec.add m.pc.layers.(top_idx).error saved_top_err };
+    m.pc <- { m.pc with layers }
   done
 
 (** Update drive signatures from output error.
