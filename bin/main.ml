@@ -31,7 +31,9 @@ let () =
   Printf.printf "Text: %d bytes | %d osc, seq=%d, batch=%d, lr=%g\n\n%!"
     text_len n_osc seq_len batch lr;
 
-  let model = Resonance.Model.create n_osc seq_len in
+  let n_layers = env "N_LAYERS" 6 in
+  let model = Resonance.Model.create ~n_osc ~n_layers ~seq_len in
+  Printf.printf "%d layers (wave-field + FFN each)\n%!" n_layers;
   let warmdown = n_steps / 5 in
 
   for step = 0 to n_steps - 1 do
