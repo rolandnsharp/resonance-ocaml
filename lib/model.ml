@@ -74,9 +74,11 @@ let resonate model tokens =
   let drives = Array.map (strike model) tokens in
   Bank.encode model.oscillators model.kernels drives
 
-(** Process: stack of wave-field + FFN layers *)
+(** Process: stack of wave-field + FFN layers (inference only) *)
 let process model states =
-  Array.fold_left (fun s layer -> Layer.forward layer s) states model.layers
+  Array.fold_left (fun s layer ->
+    let outputs, _cache = Layer.forward layer s in outputs
+  ) states model.layers
 
 (** Listen: dot product with drive signatures *)
 let listen model state =
@@ -101,33 +103,68 @@ let train_sequence model tokens ~lr =
   let seq_len = Array.length tokens in
   let lr_scaled = lr /. Float.of_int seq_len in
 
-  (* Forward through full pipeline *)
+  (* Forward through bank *)
   let initial_states = resonate model tokens in
-  let processed = process model initial_states in
 
-  let total_loss = ref 0.0 in
-  for t = 0 to seq_len - 2 do
-    let state = processed.(t) in
-    let normed = Layer.rms_norm state in
+  (* Forward through all layers, storing caches *)
+  let layer_caches = Array.make model.n_layers [||] in
+  let current = ref initial_states in
+  Array.iteri (fun i layer ->
+    let outputs, cache = Layer.forward layer !current in
+    layer_caches.(i) <- cache;
+    current := outputs
+  ) model.layers;
+  let final_states = !current in
+
+  (* Compute loss and output gradients at each position *)
+  let d_outputs = Array.init (seq_len - 1) (fun t ->
+    let normed = Layer.rms_norm final_states.(t) in
     let logits = listen model normed in
     let probs = softmax logits in
     let target = tokens.(t + 1) in
-    total_loss := !total_loss +. cross_entropy ~target probs;
-
-    (* Update drive signatures from output gradient *)
     let d_logits = logit_gradient ~target probs in
+    (* Update drive *)
     Array.iteri (fun b sig_ ->
       let dl = d_logits.(b) in
       if Float.abs dl > 1e-6 then
         Array.iteri (fun j _ ->
           sig_.(j) <- sig_.(j) -. lr_scaled *. dl *. normed.(j)
         ) sig_
-    ) model.drive
+    ) model.drive;
+    (* d_state from listen backward *)
+    Array.init model.state_dim (fun j ->
+      let acc = ref 0.0 in
+      Array.iteri (fun b sig_ ->
+        let dl = d_logits.(b) in
+        if Float.abs dl > 1e-8 then
+          acc := !acc +. dl *. sig_.(j)
+      ) model.drive; !acc)
+  ) in
+
+  (* Pad d_outputs to seq_len (last position has no target) *)
+  let d_full = Array.init seq_len (fun t ->
+    if t < seq_len - 1 then d_outputs.(t)
+    else Array.make model.state_dim 0.0
+  ) in
+
+  (* Backward through layers in reverse *)
+  let d_current = ref d_full in
+  for i = model.n_layers - 1 downto 0 do
+    let _outputs, d_inputs = Layer.train model.layers.(i)
+      (if i = 0 then initial_states
+       else let outs, _ = Layer.forward model.layers.(i-1) initial_states in outs)
+      !d_current ~lr:lr_scaled in
+    d_current := d_inputs;
+    ignore _outputs
   done;
 
-  (* TODO: backprop through layers for layer weight updates *)
-  (* For now, layers learn through the drive gradient signal *)
-
+  (* Compute total loss *)
+  let total_loss = ref 0.0 in
+  for t = 0 to seq_len - 2 do
+    let normed = Layer.rms_norm final_states.(t) in
+    let probs = softmax (listen model normed) in
+    total_loss := !total_loss +. cross_entropy ~target:tokens.(t + 1) probs
+  done;
   !total_loss /. Float.of_int (seq_len - 1)
 
 (* --- Generation --- *)
