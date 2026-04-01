@@ -1,14 +1,15 @@
-(** Text model — strike, inhibit, resonate, predict.
+(** Text model — the full pipeline in named steps.
 
-    All layers are [pos, vel] pairs. Drive weights are [pos, vel] pairs.
-    Lateral inhibition sharpens every representation.
-    Strike and listen use the same resonance signature. *)
+    strike → sharpen → settle → listen → learn
+
+    Strike and listen use the same drive signature.
+    Each step is a named function you can read and reason about. *)
 
 let vocab_size = 256
 
 type t = {
   bank : Bank.t;
-  drive : float array array;   (** byte → resonance signature (2*n_osc) *)
+  drive : float array array;
   mutable pc : Predictive.t;
   mutable state : Vec.t;
   n_osc : int;
@@ -18,7 +19,6 @@ type t = {
 let create ~n_osc ~n_layers =
   let state_dim = 2 * n_osc in
   let scale = 1.0 /. sqrt (Float.of_int state_dim) in
-  (* All layers are state_dim = 2*n_osc *)
   let dims = Array.make (n_layers + 1) state_dim in
   {
     bank = Bank.create n_osc;
@@ -26,84 +26,112 @@ let create ~n_osc ~n_layers =
       Array.init state_dim (fun _ -> (Random.float 2.0 -. 1.0) *. scale));
     pc = Predictive.create dims;
     state = Vec.zeros state_dim;
-    n_osc;
-    state_dim;
+    n_osc; state_dim;
   }
 
-(** Logits via weight-tied drive: logit_b = dot(top, drive[b]) *)
-let logits model =
-  let top = Predictive.top_activity model.pc in
-  Array.map (fun sig_ -> Vec.dot top sig_) model.drive
+(** Extract forces from a byte's drive signature (first n_osc components) *)
+let drive_forces m token =
+  Array.init m.n_osc (fun i -> m.drive.(token).(i))
 
-(** Train one token *)
-let train_token model ~token ~target ~settle_iters ~activity_lr ~weight_lr =
-  (* Strike the bank *)
-  let force = Array.init model.n_osc (fun i -> model.drive.(token).(i)) in
-  model.state <- Bank.strike model.bank model.state force;
+(** Strike the bank with a byte's force pattern *)
+let strike m token =
+  m.state <- Bank.strike m.bank m.state (drive_forces m token);
+  m.state <- Inhibit.sharpen ~n_osc:m.n_osc m.state
 
-  (* Sharpen the bank state via lateral inhibition *)
-  model.state <- Inhibit.sharpen ~n_osc:model.n_osc model.state;
-
-  (* Settle PC layers with inhibition (iPC) *)
-  let st = model.state in
-  for _ = 1 to settle_iters do
-    model.pc <- Predictive.step model.pc st ~activity_lr ~weight_lr:0.0
+(** Settle the PC layers toward equilibrium *)
+let settle m ~iters ~activity_lr =
+  let input = m.state in
+  let pc = ref m.pc in
+  for _ = 1 to iters do
+    pc := Predictive.step !pc input ~activity_lr ~weight_lr:0.0
   done;
+  m.pc <- !pc
 
-  (* Logits and loss *)
-  let raw_logits = logits model in
-  let probs = Vec.softmax raw_logits in
-  let loss = Vec.cross_entropy ~target probs in
+(** Listen: compare top layer ringing against every byte's signature *)
+let listen m =
+  let top = Predictive.top_activity m.pc in
+  Array.map (fun sig_ -> Vec.dot top sig_) m.drive
 
-  (* Output error *)
-  let output_error = Vec.mapi (fun i p ->
+(** Compute output error: softmax probability minus one-hot target *)
+let output_error ~target logits =
+  let probs = Vec.softmax logits in
+  let err = Vec.mapi (fun i p ->
     p -. (if i = target then 1.0 else 0.0)) probs in
+  (probs, err)
 
-  (* Error → top layer, settle with learning *)
-  let top = Predictive.top_activity model.pc in
-  let top_error = Vec.zeros model.state_dim in
+(** Project output error back to top PC layer through drive weights.
+    top_error = drive^T × output_error *)
+let project_error_to_top m output_err =
+  let top_err = Vec.zeros m.state_dim in
   Array.iteri (fun b sig_ ->
-    let eb = output_error.(b) in
+    let eb = output_err.(b) in
     if Float.abs eb > 1e-8 then
-      Array.iteri (fun j s -> top_error.(j) <- top_error.(j) +. eb *. s) sig_
-  ) model.drive;
+      Array.iteri (fun j s ->
+        top_err.(j) <- top_err.(j) +. eb *. s) sig_
+  ) m.drive;
+  top_err
 
-  let top_idx = model.pc.n_layers - 1 in
-  let layers = Array.copy model.pc.layers in
-  layers.(top_idx) <- {
-    layers.(top_idx) with
-    Predictive.error = top_error;
-    activity = Vec.add top (Vec.scale (-.weight_lr *. 10.0) top_error);
+(** Inject error into top PC layer and nudge activity *)
+let inject_top_error m top_err ~lr =
+  let top_idx = m.pc.n_layers - 1 in
+  let layers = Array.copy m.pc.layers in
+  let top_act = Predictive.top_activity m.pc in
+  layers.(top_idx) <- { layers.(top_idx) with
+    Predictive.error = top_err;
+    activity = Vec.add top_act (Vec.scale (-.lr *. 10.0) top_err);
   };
-  model.pc <- { model.pc with layers };
+  m.pc <- { m.pc with layers }
 
-  (* Settle with weight updates *)
-  for _ = 1 to 3 do
-    model.pc <- Predictive.step model.pc st ~activity_lr ~weight_lr
-  done;
+(** Settle PC layers with weight updates (learning phase) *)
+let settle_and_learn m ~iters ~activity_lr ~weight_lr =
+  let input = m.state in
+  for _ = 1 to iters do
+    m.pc <- Predictive.step m.pc input ~activity_lr ~weight_lr
+  done
 
-  (* Update drive weights — both directions *)
+(** Update drive signatures from output error.
+    Each byte's signature adjusts to produce better logits. *)
+let update_drives_from_output m output_err =
+  let top = Predictive.top_activity m.pc in
   Array.iteri (fun b sig_ ->
-    let eb = output_error.(b) in
+    let eb = output_err.(b) in
     if Float.abs eb > 1e-6 then
       Array.iteri (fun j _ ->
-        sig_.(j) <- sig_.(j) -. weight_lr *. eb *. top.(j)
-      ) sig_
-  ) model.drive;
+        sig_.(j) <- sig_.(j) -. 0.001 *. eb *. top.(j)) sig_
+  ) m.drive
 
-  let bottom_err = Predictive.bottom_error model.pc in
-  let dr = model.drive.(token) in
-  Array.iteri (fun i v -> dr.(i) <- v -. weight_lr *. bottom_err.(i)) dr;
+(** Update current token's drive from bottom PC error.
+    The bank's error tells us how to re-strike next time. *)
+let update_drive_from_bottom m token ~lr =
+  let err = Predictive.bottom_error m.pc in
+  let dr = m.drive.(token) in
+  Array.iteri (fun i v -> dr.(i) <- v -. lr *. err.(i)) dr
+
+(** Train on one (token, target) pair. Returns loss.
+
+    The full pipeline:
+    1. strike   — byte hits the oscillator bank
+    2. settle   — PC layers find equilibrium
+    3. listen   — compare ringing to all byte signatures
+    4. learn    — error flows back, frequencies retune *)
+let train_token m ~token ~target ~settle_iters ~activity_lr ~weight_lr =
+  strike m token;
+  settle m ~iters:settle_iters ~activity_lr;
+
+  let logits = listen m in
+  let probs, err = output_error ~target logits in
+  let loss = Vec.cross_entropy ~target probs in
+
+  let top_err = project_error_to_top m err in
+  inject_top_error m top_err ~lr:weight_lr;
+  settle_and_learn m ~iters:3 ~activity_lr ~weight_lr;
+  update_drives_from_output m err;
+  update_drive_from_bottom m token ~lr:weight_lr;
 
   loss
 
-(** Inference *)
-let infer model token =
-  let force = Array.init model.n_osc (fun i -> model.drive.(token).(i)) in
-  model.state <- Bank.strike model.bank model.state force;
-  model.state <- Inhibit.sharpen ~n_osc:model.n_osc model.state;
-  let st = model.state in
-  for _ = 1 to 3 do
-    model.pc <- Predictive.step model.pc st ~activity_lr:0.01 ~weight_lr:0.0
-  done;
-  logits model
+(** Inference: strike → settle → listen *)
+let infer m token =
+  strike m token;
+  settle m ~iters:3 ~activity_lr:0.01;
+  listen m
