@@ -31,35 +31,28 @@ let precompute_kernels oscillators seq_len =
     seq_len;
   }
 
-(** Encode: one FFT per drive column, multiply by kernel, IFFT.
-    Reuses a single padded buffer to reduce allocation. *)
+(** Convolve one oscillator's drive with its kernels → (pos, vel) arrays *)
+let convolve_one kernels drives seq_len k =
+  let fft_len = kernels.fft_len in
+  let padded = Dense.Ndarray.D.zeros [| fft_len |] in
+  for t = 0 to seq_len - 1 do
+    Dense.Ndarray.D.set padded [| t |] drives.(t).(k)
+  done;
+  let d_fft = Owl_fft.D.rfft padded in
+  let p_result = Owl_fft.D.irfft (Dense.Ndarray.Z.mul d_fft kernels.h_pos_fft.(k)) in
+  let v_result = Owl_fft.D.irfft (Dense.Ndarray.Z.mul d_fft kernels.h_vel_fft.(k)) in
+  let pos = Array.init seq_len (fun t -> Dense.Ndarray.D.get p_result [| t |]) in
+  let vel = Array.init seq_len (fun t -> Dense.Ndarray.D.get v_result [| t |]) in
+  (pos, vel)
+
+(** Encode: parallel FFT across oscillators *)
 let encode _oscillators kernels drives =
   let seq_len = Array.length drives in
   let n_osc = Array.length kernels.h_pos_fft in
-  let fft_len = kernels.fft_len in
-  let padded = Dense.Ndarray.D.zeros [| fft_len |] in
-  let pos = Array.make_matrix n_osc seq_len 0.0 in
-  let vel = Array.make_matrix n_osc seq_len 0.0 in
-  for k = 0 to n_osc - 1 do
-    (* Fill padded buffer with drive column k *)
-    for t = 0 to seq_len - 1 do
-      Dense.Ndarray.D.set padded [| t |] drives.(t).(k)
-    done;
-    for t = seq_len to fft_len - 1 do
-      Dense.Ndarray.D.set padded [| t |] 0.0
-    done;
-    let d_fft = Owl_fft.D.rfft padded in
-    (* Position *)
-    let p_result = Owl_fft.D.irfft (Dense.Ndarray.Z.mul d_fft kernels.h_pos_fft.(k)) in
-    for t = 0 to seq_len - 1 do
-      pos.(k).(t) <- Dense.Ndarray.D.get p_result [| t |]
-    done;
-    (* Velocity *)
-    let v_result = Owl_fft.D.irfft (Dense.Ndarray.Z.mul d_fft kernels.h_vel_fft.(k)) in
-    for t = 0 to seq_len - 1 do
-      vel.(k).(t) <- Dense.Ndarray.D.get v_result [| t |]
-    done
-  done;
+  (* Sequential for now — parallel overhead exceeds FFT cost *)
+  let results = Array.init n_osc (convolve_one kernels drives seq_len) in
+  (* Pack into (seq_len, 2*n_osc) *)
   Array.init seq_len (fun t ->
     Array.init (2 * n_osc) (fun k ->
-      if k < n_osc then pos.(k).(t) else vel.(k - n_osc).(t)))
+      let pos, vel = results.(k mod n_osc) in
+      if k < n_osc then pos.(t) else vel.(t)))

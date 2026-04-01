@@ -58,7 +58,40 @@ let softmax v =
 let cross_entropy ~target probs =
   -. log (Float.max 1e-10 probs.(target))
 
-(** Train: accumulate gradients over sequence, update once. *)
+(** Per-position: compute loss + gradients. Pure, no shared state. *)
+let position_grad model state target =
+  let dim = model.state_dim in
+  let n_osc = model.n_osc in
+  let transformed = transform model state in
+  let logits = listen model transformed in
+  let probs = softmax logits in
+  let loss = cross_entropy ~target probs in
+  let d_logits = Array.mapi (fun i p ->
+    p -. (if i = target then 1.0 else 0.0)) probs in
+  (* d_loss/d_transformed: only target has large d_logit (≈ p-1),
+     rest are small (≈ p). Approximate: use target + top-k *)
+  let d_trans = Array.make dim 0.0 in
+  let target_dl = d_logits.(target) in  (* this is ≈ p(target)-1, large negative *)
+  let target_sig = model.drive.(target) in
+  for j = 0 to dim - 1 do
+    d_trans.(j) <- target_dl *. target_sig.(j mod n_osc)
+  done;
+  (* Add contribution from high-probability non-target bytes *)
+  for b = 0 to vocab_size - 1 do
+    if b <> target then begin
+      let dl = d_logits.(b) in
+      if Float.abs dl > 0.01 then begin
+        let sig_ = model.drive.(b) in
+        for j = 0 to dim - 1 do
+          d_trans.(j) <- d_trans.(j) +. dl *. sig_.(j mod n_osc)
+        done
+      end
+    end
+  done;
+  let d_trans = d_trans in
+  (loss, d_trans, d_logits, transformed)
+
+(** Train: parallel gradient computation, single weight update. *)
 let train_sequence model tokens ~lr =
   let seq_len = Array.length tokens in
   let dim = model.state_dim in
@@ -67,35 +100,18 @@ let train_sequence model tokens ~lr =
   let drives = Array.map (fun tok -> model.drive.(tok)) tokens in
   let states = Bank.encode model.oscillators model.kernels drives in
 
-  (* Accumulate W gradient and drive gradient *)
+  (* Parallel: compute per-position gradients across cores *)
+  let grads = Par.init (seq_len - 1) (fun t ->
+    position_grad model states.(t) tokens.(t + 1)) in
+
+  (* Reduce: accumulate into W gradient and drive gradient *)
   let w_grad = Array.make (dim * dim) 0.0 in
   let drive_grad = Array.init vocab_size (fun _ -> Array.make n_osc 0.0) in
   let total_loss = ref 0.0 in
 
-  for t = 0 to seq_len - 2 do
+  Array.iteri (fun t (loss, d_trans, d_logits, transformed) ->
+    total_loss := !total_loss +. loss;
     let state = states.(t) in
-    let target = tokens.(t + 1) in
-    let transformed = transform model state in
-    let logits = listen model transformed in
-    let probs = softmax logits in
-    total_loss := !total_loss +. cross_entropy ~target probs;
-
-    (* d_loss/d_logits *)
-    let d_logits = Array.mapi (fun i p ->
-      p -. (if i = target then 1.0 else 0.0)) probs in
-
-    (* d_loss/d_transformed = drive^T × d_logits *)
-    let d_trans = Array.init dim (fun j ->
-      let acc = ref 0.0 in
-      for b = 0 to vocab_size - 1 do
-        let dl = d_logits.(b) in
-        if Float.abs dl > 1e-8 then
-          acc := !acc +. dl *. model.drive.(b).(j mod n_osc)
-      done;
-      !acc
-    ) in
-
-    (* Accumulate W gradient: outer(d_trans, state) *)
     for i = 0 to dim - 1 do
       let di = d_trans.(i) in
       if Float.abs di > 1e-8 then begin
@@ -105,8 +121,6 @@ let train_sequence model tokens ~lr =
         done
       end
     done;
-
-    (* Accumulate drive gradient from output error *)
     for b = 0 to vocab_size - 1 do
       let dl = d_logits.(b) in
       if Float.abs dl > 1e-6 then begin
@@ -116,9 +130,8 @@ let train_sequence model tokens ~lr =
         done
       end
     done
-  done;
+  ) grads;
 
-  (* Single weight update *)
   let scale = lr /. Float.of_int seq_len in
   Array.iteri (fun i g -> model.w.(i) <- model.w.(i) -. scale *. g) w_grad;
   Array.iteri (fun b dg ->
