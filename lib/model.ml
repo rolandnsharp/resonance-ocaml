@@ -56,7 +56,10 @@ let create n_osc seq_len =
     oscillators;
     drive = Array.init vocab_size (fun _ ->
       Array.init state_dim (fun _ -> rand ()));
-    w = Array.init (state_dim * state_dim) (fun _ -> rand ());
+    (* W starts as identity + small noise: model begins at pure architecture baseline *)
+    w = Array.init (state_dim * state_dim) (fun k ->
+      let i = k / state_dim and j = k mod state_dim in
+      (if i = j then 1.0 else 0.0) +. rand () *. 0.01);
     kernels = Bank.precompute_kernels oscillators seq_len;
     n_osc; state_dim; seq_len;
   }
@@ -132,28 +135,46 @@ let update_drives model transformed d_logits ~lr =
       ) sig_
   ) model.drive
 
-(** Learn from one position *)
-let learn_position model ~state ~target ~lr =
-  let transformed = transform model state in
-  let probs = predict model state in
-  let loss = cross_entropy ~target probs in
-  let d_logits = logit_gradient ~target probs in
-  let d_transformed = listen_backward model d_logits in
-  update_w model state d_transformed ~lr;
-  update_drives model transformed d_logits ~lr;
-  loss
-
 (* --- Training --- *)
 
+(** Train: accumulate W gradient across positions, update once *)
 let train_sequence model tokens ~lr =
   let seq_len = Array.length tokens in
+  let dim = model.state_dim in
   let lr_scaled = lr /. Float.of_int seq_len in
   let states = resonate model tokens in
+
+  let w_grad = Array.make (dim * dim) 0.0 in
   let total_loss = ref 0.0 in
+
   for t = 0 to seq_len - 2 do
-    total_loss := !total_loss +.
-      learn_position model ~state:states.(t) ~target:tokens.(t + 1) ~lr:lr_scaled
+    let state = states.(t) in
+    let target = tokens.(t + 1) in
+    let transformed = transform model state in
+    let probs = predict model state in
+    total_loss := !total_loss +. cross_entropy ~target probs;
+
+    let d_logits = logit_gradient ~target probs in
+    let d_transformed = listen_backward model d_logits in
+
+    (* Accumulate W gradient *)
+    Array.iteri (fun i di ->
+      if Float.abs di > 1e-8 then begin
+        let base = i * dim in
+        Array.iteri (fun j sj ->
+          w_grad.(base + j) <- w_grad.(base + j) +. di *. sj
+        ) state end
+    ) d_transformed;
+
+    (* Drive updates are per-byte, apply immediately *)
+    update_drives model transformed d_logits ~lr:lr_scaled
   done;
+
+  (* Single W update *)
+  Array.iteri (fun i g ->
+    model.w.(i) <- model.w.(i) -. lr_scaled *. g
+  ) w_grad;
+
   !total_loss /. Float.of_int (seq_len - 1)
 
 (* --- Generation --- *)
