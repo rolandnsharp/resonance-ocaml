@@ -39,7 +39,20 @@ let () =
   let lr = float_of_string (try Sys.getenv "LR" with _ -> "0.001") in
   let text_len = String.length text in
 
+  let warmdown_start = n_steps - n_steps / 5 in
+
   for step = 0 to n_steps - 1 do
+    (* LR schedule: warmup 200 steps, constant, cosine warmdown last 20% *)
+    let lr_scale =
+      if step < 200 then Float.of_int step /. 200.0
+      else if step >= warmdown_start then
+        let progress = Float.of_int (step - warmdown_start)
+          /. Float.of_int (n_steps - warmdown_start) in
+        0.5 *. (1.0 +. cos (Float.pi *. progress))
+      else 1.0
+    in
+    let cur_lr = lr *. lr_scale in
+
     let start = Random.int (text_len - seq_len - 1) in
     Resonance.Text_model.reset model;
 
@@ -54,13 +67,13 @@ let () =
       total_loss := !total_loss +. Resonance.Vec.cross_entropy ~target (Resonance.Vec.softmax logits);
       incr count;
 
-      Resonance.Text_model.learn model ~target ~logits ~lr
+      Resonance.Text_model.learn model ~target ~logits ~lr:cur_lr
     done;
 
     if step mod 200 = 0 then begin
       let avg = !total_loss /. Float.of_int !count in
       let bpc = avg /. log 2.0 in
-      Printf.printf "step %5d  loss %.3f  bpc %.3f" step avg bpc;
+      Printf.printf "step %5d  loss %.3f  bpc %.3f  lr %.1e" step avg bpc cur_lr;
 
       if step mod 1000 = 0 then begin
         Resonance.Text_model.reset model;

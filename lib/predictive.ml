@@ -4,8 +4,7 @@
     Error = actual - predicted.
     Weights update: Δw = lr × error ⊗ activity (Hebbian).
 
-    No backprop. No global loss signal. Each layer is autonomous.
-    The network settles to equilibrium like a physical system. *)
+    No backprop. No global loss signal. Each layer is autonomous. *)
 
 type layer = {
   activity : Vec.t;
@@ -14,7 +13,7 @@ type layer = {
 
 type t = {
   layers : layer array;
-  weights : Vec.mat array;   (* weights.(i) predicts layer i+1 from layer i *)
+  weights : Vec.mat array;
 }
 
 let create dims =
@@ -28,11 +27,9 @@ let create dims =
       Vec.mat_rand ~rows:dims.(i) ~cols:dims.(i + 1) ~scale);
   }
 
-(** One prediction: what does layer i think layer i+1 should be? *)
 let predict t i =
   Vec.mat_t_vec t.weights.(i) t.layers.(i).activity
 
-(** Compute all prediction errors (top-down) *)
 let compute_errors t =
   let n = Array.length t.layers in
   let layers = Array.copy t.layers in
@@ -42,13 +39,9 @@ let compute_errors t =
   done;
   { t with layers }
 
-(** Update activities: each layer settles toward equilibrium.
-    dx = -own_error + W * error_below
-    Pure: returns new network state. *)
 let settle ~lr t =
   let n = Array.length t.layers in
   let layers = Array.copy t.layers in
-  (* Don't update layer 0 — it's clamped to input *)
   for i = 1 to n - 2 do
     let own_err = t.layers.(i).error in
     let feedback =
@@ -63,7 +56,6 @@ let settle ~lr t =
   done;
   { t with layers }
 
-(** Update weights: local Hebbian rule. Δw = lr × activity ⊗ error *)
 let learn ~lr t =
   let n = Array.length t.layers in
   for i = 0 to n - 2 do
@@ -74,25 +66,21 @@ let learn ~lr t =
   done;
   t
 
-(** Clamp bottom layer to a given state *)
 let clamp state t =
   let layers = Array.copy t.layers in
   layers.(0) <- { layers.(0) with activity = state };
   { t with layers }
 
-(** Full step: clamp → errors → settle → learn *)
-let step ~activity_lr ~weight_lr (net : t) (input : Vec.t) =
+let step ~activity_lr ~weight_lr (net : t) (inp : Vec.t) =
   net
-  |> clamp input
+  |> clamp inp
   |> compute_errors
   |> settle ~lr:activity_lr
-  |> compute_errors         (* recompute after settling *)
+  |> compute_errors
   |> learn ~lr:weight_lr
 
-(** Read top layer activity *)
 let top_activity t =
   t.layers.(Array.length t.layers - 1).activity
 
-(** Read bottom layer error *)
 let bottom_error t =
   t.layers.(0).error

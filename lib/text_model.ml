@@ -1,18 +1,15 @@
 (** Text model — bytes strike oscillators, predictive coding learns.
 
-    token |> drive |> strike bank |> settle PC layers |> predict next token
-
-    The whole model is a pipeline of pure functions.
-    Learning is local: each layer updates from its own prediction error. *)
+    token |> drive |> strike bank |> settle PC layers |> predict next token *)
 
 let vocab_size = 256
 
 type t = {
   bank : Bank.t;
-  drive : Vec.mat;           (* vocab_size × n_osc: how each byte strikes *)
-  mutable pc : Predictive.t; (* predictive coding layers *)
-  output : Vec.mat;          (* top_dim × vocab_size: state → logits *)
-  mutable state : Vec.t;     (* oscillator bank state [pos; vel] *)
+  drive : float array array;    (* vocab_size × n_osc: byte → force *)
+  mutable pc : Predictive.t;
+  output : Vec.mat;              (* top_dim × vocab_size *)
+  mutable state : Vec.t;         (* oscillator [pos; vel] *)
   n_osc : int;
 }
 
@@ -25,9 +22,12 @@ let create ~n_osc ~n_layers =
     else if i = n_layers then top_dim
     else state_dim
   ) in
+  let drive = Array.init vocab_size (fun _ ->
+    Array.init n_osc (fun _ -> (Random.float 2.0 -. 1.0) *. scale)
+  ) in
   {
     bank = Bank.create n_osc;
-    drive = Vec.mat_rand ~rows:vocab_size ~cols:n_osc ~scale;
+    drive;
     pc = Predictive.create dims;
     output = Vec.mat_rand ~rows:top_dim ~cols:vocab_size ~scale;
     state = Vec.zeros state_dim;
@@ -39,41 +39,26 @@ let reset model =
   model.pc <- Predictive.create
     (Array.map (fun l -> Vec.dim l.Predictive.activity) model.pc.layers)
 
-(** Token → force vector (select row from drive matrix) *)
-let token_to_force model token =
-  model.drive.(token)
-
-(** Full forward: token strikes bank, PC settles, logits emerge *)
 let forward model token ~settle_steps =
-  (* Strike the bank *)
-  let force = token_to_force model token in
+  let force = model.drive.(token) in
   model.state <- Bank.strike model.bank ~decay:0.95 ~dt:0.01 model.state force;
-
-  (* Settle predictive coding with bank state as input *)
+  let st = model.state in
   let pc = ref model.pc in
-  let bank_state = model.state in
   for _ = 1 to settle_steps do
-    let net = !pc in
-    pc := Predictive.step ~activity_lr:0.1 ~weight_lr:0.0 net bank_state
+    pc := Predictive.step !pc st ~activity_lr:0.1 ~weight_lr:0.0
   done;
   model.pc <- !pc;
-
-  (* Project top layer to logits *)
   Vec.mat_t_vec model.output (Predictive.top_activity model.pc)
 
-(** Learn from one token prediction *)
 let learn model ~target ~logits ~lr =
-  (* Output error: prob - one_hot *)
   let probs = Vec.softmax logits in
   let output_error = Vec.mapi (fun i p ->
     p -. (if i = target then 1.0 else 0.0)
   ) probs in
 
-  (* Update output weights *)
   let top_act = Predictive.top_activity model.pc in
   Vec.mat_outer_update ~lr:(-.lr) model.output top_act output_error;
 
-  (* Inject error into top PC layer and settle with learning *)
   let top_idx = Array.length model.pc.layers - 1 in
   let layers = Array.copy model.pc.layers in
   let top_feedback = Vec.mat_vec model.output output_error in
@@ -84,16 +69,13 @@ let learn model ~target ~logits ~lr =
   };
   model.pc <- { model.pc with layers };
 
-  (* Let PC network settle with weight updates *)
   let st = model.state in
   for _ = 1 to 3 do
-    model.pc <- Predictive.step ~activity_lr:0.1 ~weight_lr:lr model.pc st
+    model.pc <- Predictive.step model.pc st ~activity_lr:0.1 ~weight_lr:lr
   done;
 
-  (* Update drive weights: error at bottom tells us how to re-strike *)
   let bottom_err = Predictive.bottom_error model.pc in
   let drive_row = model.drive.(target) in
-  Vec.mapi (fun i d ->
-    d -. lr *. bottom_err.(i)
-  ) drive_row
-  |> Array.iteri (fun i v -> drive_row.(i) <- v)
+  for i = 0 to model.n_osc - 1 do
+    drive_row.(i) <- drive_row.(i) -. lr *. bottom_err.(i)
+  done
