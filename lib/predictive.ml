@@ -11,6 +11,7 @@
 type layer = {
   activity : Vec.t;
   error : Vec.t;
+  precision : Vec.t;   (** Σ⁻¹ per dimension — learned attention *)
   n_osc : int;
 }
 
@@ -189,17 +190,22 @@ let create dims =
     layers = Array.init n (fun i ->
       { activity = Vec.zeros dims.(i);
         error = Vec.zeros dims.(i);
+        precision = Vec.create dims.(i) (fun _ -> 1.0);  (* start uniform *)
         n_osc = osc_per_layer.(i) });
     couplings = Array.init (n - 1) (fun i ->
       let n_osc = Int.min osc_per_layer.(i) osc_per_layer.(i + 1) in
       create_coupling ~n_in:dims.(i) ~n_out:dims.(i + 1) ~n_osc);
   }
 
+(** Precision-weighted errors: ε = Σ⁻¹ × (actual - predicted)
+    High precision = this error matters. Low precision = ignore it. *)
 let compute_errors t =
   let layers = Array.copy t.layers in
   for i = 1 to t.n_layers - 1 do
     let predicted = predict t.couplings.(i - 1) layers.(i - 1).activity in
-    layers.(i) <- { layers.(i) with error = Vec.sub layers.(i).activity predicted }
+    let raw_err = Vec.sub layers.(i).activity predicted in
+    let weighted_err = Vec.hadamard layers.(i).precision raw_err in
+    layers.(i) <- { layers.(i) with error = weighted_err }
   done;
   { t with layers }
 
@@ -219,12 +225,28 @@ let settle ~lr t =
   done;
   { t with layers }
 
+(** Learn couplings AND precision.
+    Precision update: ΔΣ⁻¹ ∝ (ε² - 1)
+    If error is large → decrease precision (this dimension is noisy)
+    If error is small → increase precision (this dimension is reliable) *)
 let learn ~lr t =
   for i = 0 to t.n_layers - 2 do
     learn_coupling ~lr t.couplings.(i)
       t.layers.(i).activity t.layers.(i + 1).error
   done;
-  t
+  (* Update precision at each layer *)
+  let layers = Array.copy t.layers in
+  for i = 1 to t.n_layers - 1 do
+    let err = t.layers.(i).error in
+    let prec = t.layers.(i).precision in
+    let new_prec = Vec.mapi (fun j p ->
+      let e2 = err.(j) *. err.(j) in
+      let dp = lr *. 0.1 *. (1.0 -. e2) in  (* push toward ε²=1 *)
+      Float.max 0.01 (Float.min 10.0 (p +. dp))
+    ) prec in
+    layers.(i) <- { layers.(i) with precision = new_prec }
+  done;
+  { t with layers }
 
 let clamp state t =
   let layers = Array.copy t.layers in
