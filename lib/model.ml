@@ -17,21 +17,26 @@ type t = {
   oscillators : Oscillator.t array;
   drive : float array array;   (** 256 × n_osc *)
   w : float array;             (** state_dim × state_dim, flat row-major *)
+  mutable kernels : Bank.kernels;  (** precomputed FFT kernels *)
   n_osc : int;
   state_dim : int;
+  seq_len : int;
 }
 
-let create n_osc =
+let create n_osc seq_len =
   let state_dim = 2 * n_osc in
   let scale = 1.0 /. sqrt (Float.of_int state_dim) in
+  let oscillators = Oscillator.spread n_osc in
   {
-    oscillators = Oscillator.spread n_osc;
+    oscillators;
     drive = Array.init vocab_size (fun _ ->
       Array.init n_osc (fun _ -> (Random.float 2.0 -. 1.0) *. scale));
     w = Array.init (state_dim * state_dim) (fun _ ->
       (Random.float 2.0 -. 1.0) *. scale);
+    kernels = Bank.precompute_kernels oscillators seq_len;
     n_osc;
     state_dim;
+    seq_len;
   }
 
 (** Matrix-vector multiply: y = W × x (W is flat row-major) *)
@@ -116,7 +121,7 @@ let train_sequence model tokens ~lr =
   let seq_len = Array.length tokens in
   let scaled_lr = lr /. Float.of_int seq_len in
   let drives = Array.map (fun tok -> model.drive.(tok)) tokens in
-  let states = Bank.encode model.oscillators drives in
+  let states = Bank.encode model.oscillators model.kernels drives in
   let total_loss = ref 0.0 in
   for t = 0 to seq_len - 2 do
     let state = states.(t) in
@@ -134,7 +139,7 @@ let generate model seed ~n_gen ~temperature =
   let buf = Buffer.create n_gen in
   for _ = 1 to n_gen do
     let drives = Array.map (fun tok -> model.drive.(tok)) context in
-    let states = Bank.encode model.oscillators drives in
+    let states = Bank.encode model.oscillators model.kernels drives in
     let state = states.(Array.length context - 1) in
     let transformed = transform model state in
     let logits = listen model transformed in

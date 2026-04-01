@@ -30,7 +30,7 @@ let () =
   Printf.printf "Resonance — FFT oscillator bank\n";
   Printf.printf "Text: %d bytes | %d osc, seq=%d, lr=%g\n\n%!" text_len n_osc seq_len lr;
 
-  let model = Resonance.Model.create n_osc in
+  let model = Resonance.Model.create n_osc seq_len in
   let warmdown = n_steps / 5 in
 
   for step = 0 to n_steps - 1 do
