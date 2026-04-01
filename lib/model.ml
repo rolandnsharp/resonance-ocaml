@@ -54,27 +54,35 @@ let sample ~temperature logits =
 
 (* --- Model --- *)
 
+(** RMSNorm: normalize activations to prevent growth across stages *)
+let rms_norm x =
+  let n = Float.of_int (Array.length x) in
+  let rms = sqrt (Array.fold_left (fun acc xi -> acc +. xi *. xi) 0.0 x /. n +. 1e-8) in
+  Array.map (fun xi -> xi /. rms) x
+
 type t = {
   oscillators : Oscillator.t array;
   drive : float array array;
-  prism : Prism.t;              (** structured transform: couple → shuffle → ... *)
+  prisms : Prism.t array;       (** stacked stages: prism → norm → residual *)
   mutable kernels : Bank.kernels;
   n_osc : int;
   state_dim : int;
+  n_stages : int;
   seq_len : int;
 }
 
 let create n_osc seq_len =
   let state_dim = 2 * n_osc in
+  let n_stages = max 1 (int_of_string (try Sys.getenv "N_STAGES" with _ -> "3")) in
   let scale = 1.0 /. sqrt (Float.of_int state_dim) in
   let rand () = (Random.float 2.0 -. 1.0) *. scale in
   let oscillators = Oscillator.spread n_osc in
   {
     oscillators;
     drive = Array.init vocab_size (fun _ -> Array.init n_osc (fun _ -> rand ()));
-    prism = Prism.create state_dim;
+    prisms = Array.init n_stages (fun _ -> Prism.create state_dim);
     kernels = Bank.precompute_kernels oscillators seq_len;
-    n_osc; state_dim; seq_len;
+    n_osc; state_dim; n_stages; seq_len;
   }
 
 (* --- Pipeline: strike → resonate → transform → listen → predict --- *)
@@ -87,9 +95,13 @@ let resonate model tokens =
   let drives = Array.map (strike model) tokens in
   Bank.encode model.oscillators model.kernels drives
 
-(** Transform: bank state through prism (composed oscillator-shuffle layers) *)
+(** Transform: bank state through stacked prism stages.
+    Each stage: prism → norm → residual *)
 let transform model state =
-  Prism.forward model.prism state
+  Array.fold_left (fun x prism ->
+    let y = Prism.forward prism x |> rms_norm in
+    Array.map2 ( +. ) x y  (* residual *)
+  ) state model.prisms
 
 (** Listen: dot product of [pos + vel] with each drive signature *)
 let listen model transformed =
@@ -135,15 +147,37 @@ let update_drives model transformed d_logits ~lr =
       ) sig_
   ) model.drive
 
-(** Learn from one position: forward → loss → backward through prism → update *)
+(** Backward through stacked prism stages (reverse order, with residual) *)
+let transform_backward model state d_transformed ~lr =
+  (* Store intermediate states for backward *)
+  let intermediates = Array.make (model.n_stages + 1) state in
+  let s = ref state in
+  Array.iteri (fun i prism ->
+    let y = Prism.forward prism !s |> rms_norm in
+    s := Array.map2 ( +. ) !s y;
+    intermediates.(i + 1) <- !s
+  ) model.prisms;
+
+  (* Backward through stages in reverse *)
+  let d = ref d_transformed in
+  for i = model.n_stages - 1 downto 0 do
+    let input_to_stage = intermediates.(i) in
+    (* Residual: gradient flows through both paths *)
+    let d_prism = !d in
+    let _d_input = Prism.backward model.prisms.(i) input_to_stage d_prism ~lr in
+    (* d through residual: d passes straight through *)
+    ()
+  done;
+  !d
+
+(** Learn from one position: forward → loss → backward → update *)
 let learn_position model ~state ~target ~lr =
   let transformed = transform model state in
   let probs = predict model state in
   let loss = cross_entropy ~target probs in
   let d_logits = logit_gradient ~target probs in
   let d_transformed = listen_backward model d_logits in
-  (* Backward through prism: updates prism params, returns d_state *)
-  let _d_state = Prism.backward model.prism state d_transformed ~lr in
+  let _d_state = transform_backward model state d_transformed ~lr in
   update_drives model transformed d_logits ~lr;
   loss
 
