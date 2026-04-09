@@ -33,7 +33,7 @@ let () =
 
   let n_layers = env "N_LAYERS" 6 in
   let model = Resonance.Model.create ~n_osc ~n_layers ~seq_len in
-  Printf.printf "%d layers (wave-field + FFN each)\n%!" n_layers;
+  Printf.printf "%d layers (pure wave — zero matrix multiply)\n%!" n_layers;
   let warmdown = n_steps / 5 in
 
   for step = 0 to n_steps - 1 do
@@ -50,9 +50,7 @@ let () =
       Array.init seq_len (fun i -> Char.code text.[start + i])
     ) in
 
-    let loss = Array.fold_left (fun acc seq ->
-      acc +. Resonance.Model.train_sequence model seq ~lr:cur_lr
-    ) 0.0 token_seqs /. Float.of_int batch in
+    let loss = Resonance.Model.train_batch model token_seqs ~lr:cur_lr in
 
     if step mod 100 = 0 then begin
       let bpc = loss /. log 2.0 in

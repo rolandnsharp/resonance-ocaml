@@ -41,6 +41,7 @@ let sample ~temperature logits =
 type t = {
   oscillators : Oscillator.t array;
   drive : float array array;       (** 256 × state_dim *)
+  d_drive : float array array;     (** gradient accumulator *)
   layers : Layer.t array;          (** stacked wave-field + FFN layers *)
   mutable kernels : Bank.kernels;
   n_osc : int;
@@ -57,8 +58,9 @@ let create ~n_osc ~n_layers ~seq_len =
     oscillators;
     drive = Array.init vocab_size (fun _ ->
       Array.init state_dim (fun _ -> (Random.float 2.0 -. 1.0) *. scale));
-    layers = Array.init n_layers (fun _ ->
-      Layer.create ~dim:state_dim ~n_osc ~seq_len);
+    d_drive = Array.init vocab_size (fun _ -> Array.make state_dim 0.0);
+    layers = Array.init n_layers (fun i ->
+      Layer.create ~n_osc ~seq_len ~layer_idx:i);
     kernels = Bank.precompute_kernels oscillators seq_len;
     n_osc; state_dim; n_layers; seq_len;
   }
@@ -93,79 +95,89 @@ let listen model state =
 let forward model processed_state =
   processed_state |> Layer.rms_norm |> listen model
 
-(** Predict *)
-let predict model state =
-  forward model state |> softmax
+(* --- Training: forward, accumulate gradients, apply --- *)
 
-(* --- Training (forward + numerical gradient on drive weights) --- *)
-
-let train_sequence model tokens ~lr =
+(** Accumulate gradients for one sequence. Returns loss.
+    No weights change — call apply_gradients after the batch. *)
+let accumulate_gradients model tokens =
   let seq_len = Array.length tokens in
-  let lr_scaled = lr /. Float.of_int seq_len in
+  let inv_t = 1.0 /. Float.of_int (seq_len - 1) in
 
-  (* Forward through bank *)
+  (* Forward: strike → resonate → layers, caching intermediates *)
   let initial_states = resonate model tokens in
-
-  (* Forward through all layers, storing caches *)
   let layer_caches = Array.make model.n_layers [||] in
   let current = ref initial_states in
-  Array.iteri (fun i layer ->
+  Array.iteri (fun _i layer ->
     let outputs, cache = Layer.forward layer !current in
-    layer_caches.(i) <- cache;
+    layer_caches.(_i) <- cache;
     current := outputs
   ) model.layers;
   let final_states = !current in
 
-  (* Compute loss and output gradients at each position *)
-  let d_outputs = Array.init (seq_len - 1) (fun t ->
-    let normed = Layer.rms_norm final_states.(t) in
-    let logits = listen model normed in
-    let probs = softmax logits in
-    let target = tokens.(t + 1) in
-    let d_logits = logit_gradient ~target probs in
-    (* Update drive *)
-    Array.iteri (fun b sig_ ->
-      let dl = d_logits.(b) in
-      if Float.abs dl > 1e-6 then
-        Array.iteri (fun j _ ->
-          sig_.(j) <- sig_.(j) -. lr_scaled *. dl *. normed.(j)
-        ) sig_
-    ) model.drive;
-    (* d_state from listen backward *)
-    Array.init model.state_dim (fun j ->
-      let acc = ref 0.0 in
-      Array.iteri (fun b sig_ ->
+  (* Loss + output gradients (computed before any weight updates) *)
+  let total_loss = ref 0.0 in
+  let d_final = Array.init seq_len (fun t ->
+    if t >= seq_len - 1 then Array.make model.state_dim 0.0
+    else begin
+      let normed = Layer.rms_norm final_states.(t) in
+      let logits = listen model normed in
+      let probs = softmax logits in
+      let target = tokens.(t + 1) in
+      total_loss := !total_loss +. cross_entropy ~target probs;
+      let d_logits = Array.map (fun x -> x *. inv_t)
+        (logit_gradient ~target probs) in
+      (* Accumulate drive gradients: d_logits ⊗ normed *)
+      Array.iteri (fun b _ ->
         let dl = d_logits.(b) in
-        if Float.abs dl > 1e-8 then
-          acc := !acc +. dl *. sig_.(j)
-      ) model.drive; !acc)
-  ) in
-
-  (* Pad d_outputs to seq_len (last position has no target) *)
-  let d_full = Array.init seq_len (fun t ->
-    if t < seq_len - 1 then d_outputs.(t)
-    else Array.make model.state_dim 0.0
+        if Float.abs dl > 1e-6 then
+          Array.iteri (fun j nj ->
+            model.d_drive.(b).(j) <- model.d_drive.(b).(j) +. dl *. nj
+          ) normed
+      ) model.drive;
+      (* d_normed from listen: drive^T × d_logits *)
+      let d_normed = Array.init model.state_dim (fun j ->
+        let acc = ref 0.0 in
+        Array.iteri (fun b sig_ ->
+          let dl = d_logits.(b) in
+          if Float.abs dl > 1e-8 then
+            acc := !acc +. dl *. sig_.(j)
+        ) model.drive; !acc
+      ) in
+      (* Backward through final RMSNorm *)
+      Layer.rms_norm_backward final_states.(t) d_normed
+    end
   ) in
 
   (* Backward through layers in reverse *)
-  let d_current = ref d_full in
+  let d_current = ref d_final in
   for i = model.n_layers - 1 downto 0 do
-    let _outputs, d_inputs = Layer.train model.layers.(i)
-      (if i = 0 then initial_states
-       else let outs, _ = Layer.forward model.layers.(i-1) initial_states in outs)
-      !d_current ~lr:lr_scaled in
-    d_current := d_inputs;
-    ignore _outputs
+    d_current := Layer.backward_sequence model.layers.(i)
+      layer_caches.(i) !d_current
   done;
 
-  (* Compute total loss *)
-  let total_loss = ref 0.0 in
-  for t = 0 to seq_len - 2 do
-    let normed = Layer.rms_norm final_states.(t) in
-    let probs = softmax (listen model normed) in
-    total_loss := !total_loss +. cross_entropy ~target:tokens.(t + 1) probs
-  done;
   !total_loss /. Float.of_int (seq_len - 1)
+
+(** Apply accumulated gradients, reset accumulators. *)
+let apply_gradients model ~lr ~batch_size =
+  let s = -. lr /. Float.of_int batch_size in
+  Array.iteri (fun b sig_ ->
+    Array.iteri (fun j _ ->
+      sig_.(j) <- sig_.(j) +. s *. model.d_drive.(b).(j);
+      model.d_drive.(b).(j) <- 0.0
+    ) sig_
+  ) model.drive;
+  Array.iter (fun layer ->
+    Layer.apply_gradients layer ~lr ~batch_size
+  ) model.layers
+
+(** Train one batch: accumulate across sequences, apply once. *)
+let train_batch model token_seqs ~lr =
+  let batch_size = Array.length token_seqs in
+  let total_loss = Array.fold_left (fun acc seq ->
+    acc +. accumulate_gradients model seq
+  ) 0.0 token_seqs in
+  apply_gradients model ~lr ~batch_size;
+  total_loss /. Float.of_int batch_size
 
 (* --- Generation --- *)
 

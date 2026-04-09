@@ -9,24 +9,9 @@ open Owl
 type kernels = {
   h_pos_fft : Dense.Ndarray.Z.arr array;
   h_vel_fft : Dense.Ndarray.Z.arr array;
-  dh_pos_fft : Dense.Ndarray.Z.arr array;  (** dh/dω for frequency learning *)
-  dh_vel_fft : Dense.Ndarray.Z.arr array;
   fft_len : int;
   seq_len : int;
 }
-
-(** dh/dω: how the impulse response changes when we retune *)
-let d_impulse_d_omega osc t =
-  let wd = Oscillator.damped_freq osc in
-  let alpha = osc.gamma *. osc.omega0 in
-  let decay = exp (-. alpha *. t) in
-  t *. decay *. cos (wd *. t) /. (Float.max 1e-8 wd)
-
-let d_impulse_vel_d_omega osc t =
-  let wd = Oscillator.damped_freq osc in
-  let alpha = osc.gamma *. osc.omega0 in
-  let decay = exp (-. alpha *. t) in
-  -. t *. decay *. sin (wd *. t)
 
 let precompute_kernels oscillators seq_len =
   let fft_len = 2 * seq_len in
@@ -40,8 +25,6 @@ let precompute_kernels oscillators seq_len =
   {
     h_pos_fft = Array.map (fun osc -> make_fft Oscillator.impulse osc) oscillators;
     h_vel_fft = Array.map (fun osc -> make_fft Oscillator.impulse_vel osc) oscillators;
-    dh_pos_fft = Array.map (fun osc -> make_fft d_impulse_d_omega osc) oscillators;
-    dh_vel_fft = Array.map (fun osc -> make_fft d_impulse_vel_d_omega osc) oscillators;
     fft_len; seq_len;
   }
 
@@ -68,18 +51,27 @@ let encode oscillators kernels drives =
     Array.init (2 * n_osc) (fun k ->
       if k < n_osc then pos.(k).(t) else vel.(k - n_osc).(t)))
 
-(** Encode with derivative kernels: same drives, dh/dω kernels.
-    Returns d_state/d_omega for each oscillator at each position. *)
-let encode_deriv oscillators kernels drives =
-  let seq_len = Array.length drives in
-  let n_osc = Array.length oscillators in
+(** Adjoint of convolve_one: convolve with conj(H) in freq domain *)
+let convolve_adjoint d_col kernel_fft fft_len seq_len =
+  let padded = Dense.Ndarray.D.zeros [| fft_len |] in
+  Array.iteri (fun i v -> Dense.Ndarray.D.set padded [| i |] v) d_col;
+  let d_fft = Owl_fft.D.rfft padded in
+  let result = Owl_fft.D.irfft
+    (Dense.Ndarray.Z.mul d_fft (Dense.Ndarray.Z.conj kernel_fft)) in
+  Array.init seq_len (fun i -> Dense.Ndarray.D.get result [| i |])
+
+(** Backward: d_bank_states → d_drives via FFT adjoint.
+    Each oscillator's pos + vel gradients convolve with conj(H). *)
+let encode_backward kernels d_states =
+  let seq_len = Array.length d_states in
+  let n_osc = Array.length d_states.(0) / 2 in
   let fft_len = kernels.fft_len in
-  let convolve_osc k kernel_arr =
-    let col = Array.init seq_len (fun t -> drives.(t).(k)) in
-    convolve_one col kernel_arr.(k) fft_len seq_len
+  let adj k h_fft offset =
+    convolve_adjoint
+      (Array.init seq_len (fun t -> d_states.(t).(k + offset)))
+      h_fft.(k) fft_len seq_len
   in
-  let dpos = Array.init n_osc (fun k -> convolve_osc k kernels.dh_pos_fft) in
-  let dvel = Array.init n_osc (fun k -> convolve_osc k kernels.dh_vel_fft) in
-  (* Return (seq_len, 2*n_osc) — gradient of state w.r.t. each osc's omega *)
-  Array.init n_osc (fun k ->
-    Array.init seq_len (fun t -> (dpos.(k).(t), dvel.(k).(t))))
+  let d_pos = Array.init n_osc (fun k -> adj k kernels.h_pos_fft 0) in
+  let d_vel = Array.init n_osc (fun k -> adj k kernels.h_vel_fft n_osc) in
+  Array.init seq_len (fun t ->
+    Array.init n_osc (fun k -> d_pos.(k).(t) +. d_vel.(k).(t)))
