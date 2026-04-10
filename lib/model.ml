@@ -139,15 +139,11 @@ let project w dim n_osc state =
     Returns the sensed output (dim = 2*n_osc). *)
 let oscillator_step (ly : layer) ~gamma ~beta ~sense bank_out =
   let n = ly.n_osc in
-  let oscillators_ref = Oscillator.spread n in
   for k = 0 to n - 1 do
-    let omega = oscillators_ref.(k).omega0 in
     let g = gamma.(k) and b = beta.(k) in
     let x = ly.osc_pos.(k) and v = ly.osc_vel.(k) in
-    let drive_pos = b *. bank_out.(k) in
-    let drive_vel = b *. bank_out.(k + n) in
-    let new_v = v -. (omega *. omega *. x +. 2.0 *. g *. omega *. v) +. drive_vel in
-    let new_x = x +. v +. drive_pos in
+    let new_x = g *. x +. (1.0 -. g) *. (b *. bank_out.(k)) in
+    let new_v = g *. v +. (1.0 -. g) *. (b *. bank_out.(k + n)) in
     ly.osc_pos.(k) <- new_x;
     ly.osc_vel.(k) <- new_v
   done;
@@ -272,12 +268,13 @@ let train_online model tokens ~lr =
       let d_gamma = Array.make n_osc 0.0 in
       let d_beta = Array.make n_osc 0.0 in
       for k = 0 to n_osc - 1 do
-        let omega = (Oscillator.spread n_osc).(k).omega0 in
-        (* d_gamma: affects velocity via -2γω₀v term *)
-        d_gamma.(k) <- d_osc_state.(k + n_osc) *. (-2.0 *. omega *. prev_vel.(k));
-        (* d_beta: affects both pos and vel via drive *)
-        d_beta.(k) <- d_osc_state.(k) *. bank_t.(k)
-                   +. d_osc_state.(k + n_osc) *. bank_t.(k + n_osc)
+        let b = beta.(k) and g = gamma.(k) in
+        (* d_gamma: x_new = g*x_prev + (1-g)*b*bank → d/dg = x_prev - b*bank *)
+        d_gamma.(k) <- d_osc_state.(k) *. (prev_vel.(k) -. b *. bank_t.(k))
+                     +. d_osc_state.(k + n_osc) *. (prev_vel.(k) -. b *. bank_t.(k + n_osc));
+        (* d_beta: d/db = (1-g)*bank *)
+        d_beta.(k) <- d_osc_state.(k) *. ((1.0 -. g) *. bank_t.(k))
+                   +. d_osc_state.(k + n_osc) *. ((1.0 -. g) *. bank_t.(k + n_osc))
       done;
 
       (* Update projections: w_gamma, w_beta, w_sense *)
