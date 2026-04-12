@@ -7,7 +7,7 @@
 ## All per-position (no recurrence in this version — fast on GPU).
 ## Damped rotation recurrence will be added once this baseline converges.
 
-import std/[math, os, strformat, strutils, times, random]
+import std/[math, os, strformat, strutils, times, random, algorithm]
 import gpu, model
 
 const
@@ -16,9 +16,49 @@ const
   opTNA = 5  # C += A^T @ B
 
 proc loadText(path: string): seq[int32] =
+  ## Load raw text as byte tokens (vocab 256)
   let data = readFile(path)
   result = newSeq[int32](data.len)
   for i, c in data: result[i] = c.int32
+
+proc loadShard(path: string): seq[int32] =
+  ## Load a FineWeb binary shard (header + uint16/uint32 tokens)
+  let f = open(path, fmRead)
+  var header: array[256, int32]
+  discard f.readBuffer(addr header[0], 256 * 4)
+  assert header[0] == 20240520, "Bad shard magic: " & $header[0]
+  let ntok = header[2]
+  let version = header[1]
+  if version == 1:
+    # uint16 tokens
+    var raw = newSeq[uint16](ntok)
+    discard f.readBuffer(addr raw[0], ntok * 2)
+    result = newSeq[int32](ntok)
+    for i in 0..<ntok: result[i] = raw[i].int32
+  elif version == 7:
+    # uint32 tokens
+    var raw = newSeq[uint32](ntok)
+    discard f.readBuffer(addr raw[0], ntok * 4)
+    result = newSeq[int32](ntok)
+    for i in 0..<ntok: result[i] = raw[i].int32
+  else:
+    quit "Unknown shard version: " & $version
+  f.close()
+
+proc loadData(path: string): seq[int32] =
+  ## Auto-detect: raw text (.txt) or FineWeb shard (.bin)
+  if path.endsWith(".txt"):
+    loadText(path)
+  else:
+    loadShard(path)
+
+proc findShards(dir: string): seq[string] =
+  ## Find all training shards in a directory
+  result = @[]
+  for kind, path in walkDir(dir):
+    if kind == pcFile and path.contains("train") and path.endsWith(".bin"):
+      result.add(path)
+  result.sort()
 
 proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: float32) =
   let dim = m.dim
@@ -301,11 +341,36 @@ proc main() =
   let nOsc = if paramCount() >= 2: parseInt(paramStr(2)) else: 96
   let nLayers = if paramCount() >= 3: parseInt(paramStr(3)) else: 6
   let steps = if paramCount() >= 4: parseInt(paramStr(4)) else: 5000
+  let vocabSize = if paramCount() >= 5: parseInt(paramStr(5)) else: 0  # 0 = auto
+  let seqLen = if paramCount() >= 6: parseInt(paramStr(6)) else: 128
+  let batchSize = if paramCount() >= 7: parseInt(paramStr(7)) else: 64
 
-  let data = loadText(dataPath)
-  echo &"Data: {data.len} bytes from {dataPath}"
+  # Load data — either single file or cycle through shards
+  var data: seq[int32]
+  var vocab: int
 
-  var m = createModel(nOsc, nLayers, vocabSize = 256, seqLen = 128)
-  train(m, data, steps, seqLen = 128, batchSize = 64, lr = 3e-4)
+  if dataPath.endsWith(".txt"):
+    data = loadText(dataPath)
+    vocab = if vocabSize > 0: vocabSize else: 256
+    echo &"Data: {data.len} bytes from {dataPath} (vocab {vocab})"
+  elif dirExists(dataPath):
+    # Directory of shards — load first shard to start, cycle in training
+    let shards = findShards(dataPath)
+    echo &"Found {shards.len} training shards in {dataPath}"
+    # Concatenate all shards (simple approach for now)
+    data = @[]
+    for s in shards:
+      let shard = loadShard(s)
+      data.add(shard)
+      if data.len > 100_000_000: break  # cap at 100M tokens
+    vocab = if vocabSize > 0: vocabSize else: 1024
+    echo &"Data: {data.len} tokens (vocab {vocab})"
+  else:
+    data = loadData(dataPath)
+    vocab = if vocabSize > 0: vocabSize else: 1024
+    echo &"Data: {data.len} tokens from {dataPath} (vocab {vocab})"
+
+  var m = createModel(nOsc, nLayers, vocabSize = vocab, seqLen = seqLen)
+  train(m, data, steps, seqLen = seqLen, batchSize = batchSize, lr = 3e-4)
 
 main()
