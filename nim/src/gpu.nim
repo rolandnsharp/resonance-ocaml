@@ -211,6 +211,9 @@ proc gpu_bank_gather*(drives, columns: pointer,
     batchSize, seqLen, n_osc, fft_len: cint) {.importc, cdecl.}
 proc gpu_strided_gather*(src, dst: pointer,
     rows, stride, n_osc, col_offset: cint) {.importc, cdecl.}
+proc gpu_add_bias*(x, bias: pointer, cols, n: cint) {.importc, cdecl.}
+proc gpu_bias_grad*(dout, dbias: pointer, cols, rows: cint) {.importc, cdecl.}
+
 proc gpu_spectral_mul_gated*(spec_in, spec_out: pointer,
     wRe, wIm, gate: pointer, specLen, batch: cint) {.importc, cdecl.}
 proc gpu_spectral_mul_gated_bwd*(spec_in, d_spec_out: pointer,

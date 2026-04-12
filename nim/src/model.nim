@@ -22,10 +22,14 @@ type
     projGamma*: Param    # dim → n_osc (damping control)
     projBeta*: Param     # dim → n_osc (absorption control)
     projSense*: Param    # dim → n_osc (readout sensitivity)
-    # Spectral mixing: FFT across oscillator dim, learned complex weights, IFFT
-    spectralRe*: Param   # dim/2+1 real parts of spectral weights
-    spectralIm*: Param   # dim/2+1 imag parts
-    gateProj*: Param     # dim → dim/2+1 for content-dependent spectral gate
+    # Interference: dense W computes pairwise cross-terms
+    spectralRe*: Param   # reused as wMix (dim × dim)
+    spectralIm*: Param   # unused placeholder
+    gateProj*: Param     # unused placeholder
+    # Projection biases
+    projGammaBias*: Param
+    projBetaBias*: Param
+    projSenseBias*: Param
     mixScale*: Param     # dim (residual scaling)
 
   Model* = object
@@ -90,16 +94,14 @@ proc createModel*(nOsc, nLayers, vocabSize, seqLen: int): Model =
     result.layers[l].projGamma = initParam(dim * nOsc, projScale)
     result.layers[l].projBeta = initParam(dim * nOsc, projScale)
     result.layers[l].projSense = initParam(dim * nOsc, projScale)
-    # Spectral mixing: FFT across dim, learned complex weights
-    let specLen = dim div 2 + 1  # rfft output length
-    result.layers[l].spectralRe = initParam(specLen, 0.0)
-    result.layers[l].spectralIm = initParam(specLen, 0.0)
-    # Init spectral weights to identity (passthrough): real=1, imag=0
-    var onesSpec = newSeq[float32](specLen)
-    for i in 0..<specLen: onesSpec[i] = 1.0
-    result.layers[l].spectralRe.w.gpuUpload(onesSpec)
-    # Content gate projection: dim → specLen
-    result.layers[l].gateProj = initParam(dim * specLen, projScale)
+    # Interference: dense W computes all pairwise cross-terms between oscillators
+    result.layers[l].spectralRe = initParam(dim * dim, scale)  # reuse field as wMix
+    result.layers[l].spectralIm = initParam(0)  # unused
+    result.layers[l].gateProj = initParam(0)   # unused
+    # Projection biases (Python had these, we didn't)
+    result.layers[l].projGammaBias = initParam(nOsc, 0.0)
+    result.layers[l].projBetaBias = initParam(nOsc, 0.0)
+    result.layers[l].projSenseBias = initParam(nOsc, 0.0)
     result.layers[l].mixScale = initParam(dim, 0.0)
     # Init mixScale to ones
     var ones = newSeq[float32](dim)
@@ -180,4 +182,5 @@ proc countParams*(m: Model): int =
   result = m.drive.n + m.wOut.n
   for l in m.layers:
     result += l.projGamma.n + l.projBeta.n + l.projSense.n +
-              l.spectralRe.n + l.spectralIm.n + l.gateProj.n + l.mixScale.n
+              l.spectralRe.n + l.projGammaBias.n + l.projBetaBias.n +
+              l.projSenseBias.n + l.mixScale.n

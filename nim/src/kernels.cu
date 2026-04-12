@@ -337,6 +337,30 @@ extern "C" void gpu_strided_gather(const float* src, float* dst,
     k_strided_gather<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(src, dst, rows, stride, n_osc, col_offset, 0);
 }
 
+/* ---- Add bias: each row gets the same bias vector added ---- */
+__global__ void k_add_bias(float* x, const float* bias, int cols, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] += bias[i % cols];
+}
+
+__global__ void k_bias_grad(const float* dout, float* dbias, int cols, int rows) {
+    // Sum dout across rows to get dbias
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= cols) return;
+    float sum = 0.0f;
+    for (int r = 0; r < rows; r++)
+        sum += dout[r * cols + j];
+    atomicAdd(&dbias[j], sum);
+}
+
+extern "C" void gpu_add_bias(float* x, const float* bias, int cols, int n) {
+    k_add_bias<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(x, bias, cols, n);
+}
+extern "C" void gpu_bias_grad(const float* dout, float* dbias, int cols, int rows) {
+    k_bias_grad<<<(cols+BLOCK-1)/BLOCK, BLOCK>>>(dout, dbias, cols, rows);
+}
+
 /* ---- Spectral mixing: batched FFT across dim, pointwise complex multiply, IFFT ---- */
 
 // Complex pointwise multiply with learned weights + content gate

@@ -147,12 +147,15 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
     for l in 0..<nL:
       gpu_rmsnorm(states[l].data, normed[l].data, dim.cint, BT.cint)
 
-      # Project controls: gamma, beta, sense (dim → n_osc each)
+      # Project controls with bias: gamma, beta, sense (dim → n_osc each)
       gpuSgemm(opNN, BT, nOsc, dim, normed[l], m.layers[l].projGamma.w, gammaBuf)
+      gpu_add_bias(gammaBuf.data, m.layers[l].projGammaBias.w.data, nOsc.cint, (BT * nOsc).cint)
       gpu_sigmoid(gammaBuf.data, gammaBuf.data, (BT * nOsc).cint)
       gpuSgemm(opNN, BT, nOsc, dim, normed[l], m.layers[l].projBeta.w, betaBuf)
+      gpu_add_bias(betaBuf.data, m.layers[l].projBetaBias.w.data, nOsc.cint, (BT * nOsc).cint)
       gpu_sigmoid(betaBuf.data, betaBuf.data, (BT * nOsc).cint)
       gpuSgemm(opNN, BT, nOsc, dim, normed[l], m.layers[l].projSense.w, senseBuf)
+      gpu_add_bias(senseBuf.data, m.layers[l].projSenseBias.w.data, nOsc.cint, (BT * nOsc).cint)
       gpu_sigmoid(senseBuf.data, senseBuf.data, (BT * nOsc).cint)
 
       # Damped rotation scan: one kernel, parallel over (batch × oscillator)
@@ -161,20 +164,9 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
         m.cosW.data, m.sinW.data, m.freqs.data,
         batchSize.cint, seqLen.cint, nOsc.cint)
 
-      # Spectral mixing: FFT across oscillator dim → learned weights × gate → IFFT
-      let specLen = dim div 2 + 1
-      # Content gate: project mean state to specLen, sigmoid
-      gpuSgemm(opNN, BT, specLen, dim, normed[l], m.layers[l].gateProj.w, gateBuf)
-      gpu_sigmoid(gateBuf.data, gateBuf.data, (BT * specLen).cint)
-      # FFT each row across dim
-      discard gpu_fft_r2c_batched(oscOutBuf.data, specFftBuf.data, dim.cint, BT.cint)
-      # Multiply by learned weights with gate
-      gpu_spectral_mul_gated(specFftBuf.data, specProdBuf.data,
-        m.layers[l].spectralRe.w.data, m.layers[l].spectralIm.w.data,
-        gateBuf.data, specLen.cint, BT.cint)
-      # IFFT back
-      discard gpu_fft_c2r_batched(specProdBuf.data, mixed[l].data, dim.cint, BT.cint)
-      gpu_scale_array(mixed[l].data, 1.0 / dim.float32, (BT * dim).cint)
+      # Interference: dense W computes all pairwise cross-terms between oscillators
+      # spectralRe is repurposed as wMix (dim × dim)
+      gpuSgemm(opNN, BT, dim, dim, oscOutBuf, m.layers[l].spectralRe.w, mixed[l])
       gpu_sinegate_fwd(mixed[l].data, actBuf.data, (BT * dim).cint)
       gpu_add(states[l].data, actBuf.data, states[l+1].data, (BT * dim).cint)
 
@@ -205,21 +197,9 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
       # Through SineGate: dMix = dState * sinegate'(mixed)
       gpu_sinegate_bwd(mixed[l].data, dStateBuf.data, dMixBuf.data, (BT * dim).cint)
 
-      # Through spectral mixing backward
-      gpu_scale_array(dMixBuf.data, 1.0 / dim.float32, (BT * dim).cint)
-      # FFT dMix and recompute forward FFT of oscOut
-      discard gpu_fft_r2c_batched(dMixBuf.data, specProdBuf.data, dim.cint, BT.cint)
-      discard gpu_fft_r2c_batched(oscOutBuf.data, specFftBuf.data, dim.cint, BT.cint)
-      # Backward through spectral multiply
-      let dSpecIn = specFftBuf  # reuse (overwrite forward FFT, we're done with it)
-      gpu_spectral_mul_gated_bwd(
-        specFftBuf.data, specProdBuf.data,
-        m.layers[l].spectralRe.w.data, m.layers[l].spectralIm.w.data, gateBuf.data,
-        dSpecIn.data, m.layers[l].spectralRe.g.data, m.layers[l].spectralIm.g.data,
-        gateBuf.data, specLen.cint, BT.cint)
-      # IFFT d_spec_in back to dOscOut
-      discard gpu_fft_c2r_batched(dSpecIn.data, dOscOutBuf.data, dim.cint, BT.cint)
-      gpu_scale_array(dOscOutBuf.data, 1.0 / dim.float32, (BT * dim).cint)
+      # Through interference (dense W): dW += oscOut^T @ dMix, dOscOut = dMix @ W^T
+      gpuSgemm(opTNA, dim, dim, BT, oscOutBuf, dMixBuf, m.layers[l].spectralRe.g)
+      gpuSgemm(opNT, BT, dim, dim, dMixBuf, m.layers[l].spectralRe.w, dOscOutBuf)
 
       # Through rotation scan backward
       gpu_rotation_scan_bwd(
@@ -291,9 +271,10 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
     m.drive.adamStep(curLr * 3.0, b1, b2, 0, bc1, bc2)
     m.wOut.adamStep(curLr, b1, b2, wd, bc1, bc2)
     for l in 0..<nL:
-      m.layers[l].spectralRe.adamStep(curLr, b1, b2, 0, bc1, bc2)
-      m.layers[l].spectralIm.adamStep(curLr, b1, b2, 0, bc1, bc2)
-      m.layers[l].gateProj.adamStep(curLr, b1, b2, wd, bc1, bc2)
+      m.layers[l].spectralRe.adamStep(curLr, b1, b2, wd, bc1, bc2)  # wMix
+      m.layers[l].projGammaBias.adamStep(curLr, b1, b2, 0, bc1, bc2)
+      m.layers[l].projBetaBias.adamStep(curLr, b1, b2, 0, bc1, bc2)
+      m.layers[l].projSenseBias.adamStep(curLr, b1, b2, 0, bc1, bc2)
       m.layers[l].projGamma.adamStep(curLr, b1, b2, wd, bc1, bc2)
       m.layers[l].projBeta.adamStep(curLr, b1, b2, wd, bc1, bc2)
       m.layers[l].projSense.adamStep(curLr, b1, b2, wd, bc1, bc2)
