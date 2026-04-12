@@ -209,25 +209,29 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
         m.cosW.data, m.sinW.data, m.freqs.data,
         batchSize.cint, seqLen.cint, nOsc.cint)
 
-      # Through sigmoid: d_pre = d_post * sig * (1-sig)
+      # Through sigmoid + projection weight/bias grad + dNormed accumulation
+      # Do each projection once: sigmoid_bwd → weight grad → bias grad → normed grad
+      let opNTA = 3  # opNT + accumulate
+
       # gamma
       gpu_sigmoid_bwd(gammaBuf.data, dGammaBuf.data, dProjBuf.data, (BT * nOsc).cint)
-      # dProjGamma += normed^T @ dProjBuf : (dim, BT) @ (BT, nOsc) = (dim, nOsc)
       gpuSgemm(opTNA, dim, nOsc, BT, normed[l], dProjBuf, m.layers[l].projGamma.g)
+      gpu_bias_grad(dProjBuf.data, m.layers[l].projGammaBias.g.data, nOsc.cint, BT.cint)
+      gpuSgemm(opNTA, BT, dim, nOsc, dProjBuf, m.layers[l].projGamma.w, dNormBuf)
+
       # beta
       gpu_sigmoid_bwd(betaBuf.data, dBetaBuf.data, dProjBuf.data, (BT * nOsc).cint)
       gpuSgemm(opTNA, dim, nOsc, BT, normed[l], dProjBuf, m.layers[l].projBeta.g)
+      gpu_bias_grad(dProjBuf.data, m.layers[l].projBetaBias.g.data, nOsc.cint, BT.cint)
+      gpuSgemm(opNTA, BT, dim, nOsc, dProjBuf, m.layers[l].projBeta.w, dNormBuf)
+
       # sense
       gpu_sigmoid_bwd(senseBuf.data, dSenseBuf.data, dProjBuf.data, (BT * nOsc).cint)
       gpuSgemm(opTNA, dim, nOsc, BT, normed[l], dProjBuf, m.layers[l].projSense.g)
+      gpu_bias_grad(dProjBuf.data, m.layers[l].projSenseBias.g.data, nOsc.cint, BT.cint)
+      gpuSgemm(opNTA, BT, dim, nOsc, dProjBuf, m.layers[l].projSense.w, dNormBuf)
 
-      # dNorm from projections: dProjBuf @ projW^T for each projection
-      # Approximate: just use dNorm from the W_mix path (skip proj backward to normed)
-      # TODO: accumulate dNorm from all three projections
-
-      # Through RMSNorm: dState += rmsnorm_bwd(dNorm_from_W_mix_path)
-      # The W_mix backward gave us dOscOut, not dNorm. We need dNorm from the projection path.
-      # For now: use dBankBuf as approximate dState contribution
+      # Through RMSNorm with complete dNormed (W_mix + all projections)
       gpu_rmsnorm_bwd(states[l].data, dNormBuf.data, dNormBuf.data, dim.cint, BT.cint)
       gpu_add_inplace(dStateBuf.data, dNormBuf.data, (BT * dim).cint)
 
