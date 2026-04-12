@@ -152,52 +152,35 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
               0.5 * (1.0 + cos(PI * progress))
     let curLr = lr * s
 
-    # === Forward: strike → propagate → [resonate → interfere → harmonics → superpose] × L → listen ===
+    # === Forward: strike → propagate → [gate → resonate → interfere → harmonics] × L → listen ===
 
-    # Strike: token → oscillator excitation
-    tokBuf.strike(m.drive.w, driveBuf, nOsc, BT)
+    tokBuf |> strike(m.drive.w, driveBuf, nOsc, BT)
 
-    # Propagate: FFT convolve drives with oscillator impulse responses
-    driveBuf.propagate(columnsBuf, colsFft, prodPosFft, prodVelFft, convPosBuf, convVelBuf,
-                       m.hPosFft, m.hVelFft, states[0],
-                       batchSize, seqLen, nOsc, dim, fftLen, fftCLen, totalOsc)
+    driveBuf |> propagate(columnsBuf, colsFft, prodPosFft, prodVelFft,
+                          convPosBuf, convVelBuf, m.hPosFft, m.hVelFft, states[0],
+                          batchSize, seqLen, nOsc, dim, fftLen, fftCLen, totalOsc)
 
-    # Layer stack: normalize → gate → resonate → interfere → harmonics → superpose
     for l in 0..<nL:
       let ly = m.layers[l]
 
-      # Normalize: scale to unit energy
-      states[l].normalize(normed[l], dim, BT)
+      states[l] |> normalize(normed[l], dim, BT)
 
-      # Gate: project state → per-oscillator controls (how to remember, absorb, read)
-      normed[l].project(ly.projGamma.w, gammaBuf, BT, nOsc, dim)
-      gammaBuf.addBias(ly.projGammaBias.w, nOsc, BT * nOsc)
-      gammaBuf.activate(BT * nOsc)
+      normed[l] |> project(ly.projGamma.w, gammaBuf, BT, nOsc, dim)
+      gammaBuf  |> addBias(ly.projGammaBias.w, nOsc, BT * nOsc) |> activate(BT * nOsc)
+      normed[l] |> project(ly.projBeta.w, betaBuf, BT, nOsc, dim)
+      betaBuf   |> addBias(ly.projBetaBias.w, nOsc, BT * nOsc) |> activate(BT * nOsc)
+      normed[l] |> project(ly.projSense.w, senseBuf, BT, nOsc, dim)
+      senseBuf  |> addBias(ly.projSenseBias.w, nOsc, BT * nOsc) |> activate(BT * nOsc)
 
-      normed[l].project(ly.projBeta.w, betaBuf, BT, nOsc, dim)
-      betaBuf.addBias(ly.projBetaBias.w, nOsc, BT * nOsc)
-      betaBuf.activate(BT * nOsc)
+      gammaBuf |> resonate(betaBuf, senseBuf, states[0], oscOutBuf,
+                           m.cosW, m.sinW, m.freqs, batchSize, seqLen, nOsc)
 
-      normed[l].project(ly.projSense.w, senseBuf, BT, nOsc, dim)
-      senseBuf.addBias(ly.projSenseBias.w, nOsc, BT * nOsc)
-      senseBuf.activate(BT * nOsc)
+      oscOutBuf |> interfere(ly.spectralRe.w, mixed[l], BT, dim)
+      mixed[l]  |> harmonics(actBuf, BT * dim)
+      states[l] |> superpose(actBuf, states[l+1], BT * dim)
 
-      # Resonate: damped rotation — the oscillator equation
-      gammaBuf.resonate(betaBuf, senseBuf, states[0], oscOutBuf,
-                        m.cosW, m.sinW, m.freqs, batchSize, seqLen, nOsc)
-
-      # Interfere: pairwise cross-terms between oscillators
-      oscOutBuf.interfere(ly.spectralRe.w, mixed[l], BT, dim)
-
-      # Harmonics: x × sin(x) — overtone generation
-      mixed[l].harmonics(actBuf, BT * dim)
-
-      # Superpose: residual — waves add
-      states[l].superpose(actBuf, states[l+1], BT * dim)
-
-    # Listen: normalize → project → dot with drive signatures
-    states[nL].normalize(normed[nL], dim, BT)
-    normed[nL].interfere(m.wOut.w, logitBuf, BT, vocab)  # W_out as final interference
+    states[nL] |> normalize(normed[nL], dim, BT)
+    normed[nL] |> interfere(m.wOut.w, logitBuf, BT, vocab)
 
     # Loss
     gpu_ce_loss(logitBuf.data, tgtBuf.data, lossBuf.data, vocab.cint, BT.cint)

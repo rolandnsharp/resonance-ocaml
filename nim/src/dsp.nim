@@ -13,7 +13,16 @@
 ## No hidden allocations. Every buffer is pre-allocated.
 ## This is the aither way: explicit state, pipeline flow.
 
+import std/macros
 import gpu
+
+# ── Pipe operator (from aitherNim) ──
+
+macro `|>`*(lhs: typed, rhs: untyped): untyped =
+  ## Insert lhs as the first argument of rhs.
+  ## `x |> f(y, z)` becomes `f(x, y, z)`
+  result = rhs.copyNimTree()
+  result.insert(1, lhs)
 
 type
   Buf* = GpuBuf  ## Alias — a signal is just a GPU buffer with a name
