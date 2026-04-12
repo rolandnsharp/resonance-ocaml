@@ -198,10 +198,10 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
       gpu_add_bias(senseBuf.data, m.layers[l].projSenseBias.w.data, nOsc.cint, (BT * nOsc).cint)
       gpu_sigmoid(senseBuf.data, senseBuf.data, (BT * nOsc).cint)
 
-      # Damped rotation scan
+      # Damped rotation scan with feedback (gradient highway)
       gpu_rotation_scan(gammaBuf.data, betaBuf.data, senseBuf.data,
         states[0].data, oscOutBuf.data,
-        m.cosW.data, m.sinW.data, m.freqs.data,
+        m.cosW.data, m.sinW.data, m.freqs.data, m.layers[l].feedback.w.data,
         batchSize.cint, seqLen.cint, nOsc.cint)
 
       # Interference: dense W computes all pairwise cross-terms between oscillators
@@ -246,7 +246,8 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
         gammaBuf.data, betaBuf.data, senseBuf.data,
         states[0].data, oscOutBuf.data, dOscOutBuf.data,
         dGammaBuf.data, dBetaBuf.data, dSenseBuf.data, dBankBuf.data,
-        m.cosW.data, m.sinW.data, m.freqs.data,
+        m.layers[l].feedback.g.data,
+        m.cosW.data, m.sinW.data, m.freqs.data, m.layers[l].feedback.w.data,
         batchSize.cint, seqLen.cint, nOsc.cint)
 
       # Through sigmoid + projection weight/bias grad + dNormed accumulation
@@ -316,6 +317,7 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
     m.wOut.adamStep(curLr, b1, b2, wd, bc1, bc2)
     for l in 0..<nL:
       m.layers[l].spectralRe.adamStep(curLr, b1, b2, wd, bc1, bc2)  # wMix
+      m.layers[l].feedback.adamStep(curLr, b1, b2, 0, bc1, bc2)
       m.layers[l].projGammaBias.adamStep(curLr, b1, b2, 0, bc1, bc2)
       m.layers[l].projBetaBias.adamStep(curLr, b1, b2, 0, bc1, bc2)
       m.layers[l].projSenseBias.adamStep(curLr, b1, b2, 0, bc1, bc2)

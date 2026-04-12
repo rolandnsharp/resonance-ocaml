@@ -540,6 +540,7 @@ __global__ void k_rotation_scan(
     const float* gamma, const float* beta, const float* sense,
     const float* bank_out, float* osc_out,
     const float* cos_w, const float* sin_w, const float* freqs,
+    const float* feedback,  // per-oscillator feedback gain
     int batch_size, int seq_len, int n_osc)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -549,22 +550,29 @@ __global__ void k_rotation_scan(
 
     float pos = 0.0f, vel = 0.0f;
     float cw = cos_w[k], sw = sin_w[k], f = freqs[k];
+    float fb = feedback[k];  // learned feedback gain
+    float prev_out_p = 0.0f, prev_out_v = 0.0f;  // previous output for feedback
 
     for (int t = 0; t < seq_len; t++) {
         int row = b * seq_len + t;
         float g = gamma[row * n_osc + k];
         float bt = beta[row * n_osc + k];
         float s = sense[row * n_osc + k];
-        float dp = bank_out[row * 2 * n_osc + k];
-        float dv = bank_out[row * 2 * n_osc + n_osc + k];
+
+        // Drive = bank encoding + feedback from previous output
+        float dp = bank_out[row * 2 * n_osc + k] + fb * prev_out_p;
+        float dv = bank_out[row * 2 * n_osc + n_osc + k] + fb * prev_out_v;
 
         float new_pos = g * (pos * cw + vel * sw / f) + (1.0f - g) * bt * dp;
         float new_vel = g * (vel * cw - pos * f * sw) + (1.0f - g) * bt * dv;
         pos = new_pos;
         vel = new_vel;
 
-        osc_out[row * 2 * n_osc + k] = s * pos;
-        osc_out[row * 2 * n_osc + n_osc + k] = s * vel;
+        // Output with sense gating
+        prev_out_p = s * pos;
+        prev_out_v = s * vel;
+        osc_out[row * 2 * n_osc + k] = prev_out_p;
+        osc_out[row * 2 * n_osc + n_osc + k] = prev_out_v;
     }
 }
 
@@ -572,12 +580,13 @@ extern "C" void gpu_rotation_scan(
     const float* gamma, const float* beta, const float* sense,
     const float* bank_out, float* osc_out,
     const float* cos_w, const float* sin_w, const float* freqs,
+    const float* feedback,
     int batch_size, int seq_len, int n_osc)
 {
     int n = batch_size * n_osc;
     k_rotation_scan<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(
         gamma, beta, sense, bank_out, osc_out,
-        cos_w, sin_w, freqs, batch_size, seq_len, n_osc);
+        cos_w, sin_w, freqs, feedback, batch_size, seq_len, n_osc);
 }
 
 /* ---- Backward rotation scan ----
@@ -593,8 +602,9 @@ __global__ void k_rotation_scan_bwd(
     const float* bank_out, const float* osc_out,
     const float* d_osc_out,
     float* d_gamma, float* d_beta, float* d_sense,
-    float* d_bank_out,
+    float* d_bank_out, float* d_feedback,
     const float* cos_w, const float* sin_w, const float* freqs,
+    const float* feedback,
     int batch_size, int seq_len, int n_osc)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -602,6 +612,7 @@ __global__ void k_rotation_scan_bwd(
     int b = idx / n_osc;
     int k = idx % n_osc;
     float cw = cos_w[k], sw = sin_w[k], f = freqs[k];
+    float fb = feedback[k];
 
     // First: re-run forward to save all (pos, vel) states
     // We need pos/vel at each timestep for the backward
@@ -609,38 +620,57 @@ __global__ void k_rotation_scan_bwd(
     // Use shared memory or just recompute. Let's recompute by storing in global.
     // Actually, let's use a simple approach: two passes.
 
-    // Pass 1: Forward, saving prev states into d_bank_out (repurposed as scratch)
+    // Pass 1: Forward with feedback, saving prev states into d_bank_out (scratch)
     float pos = 0.0f, vel = 0.0f;
+    float prev_out_p = 0.0f, prev_out_v = 0.0f;
+    float d_fb_accum = 0.0f;  // accumulate d_feedback across timesteps
+
     for (int t = 0; t < seq_len; t++) {
         int row = b * seq_len + t;
         d_bank_out[row * 2 * n_osc + k] = pos;
         d_bank_out[row * 2 * n_osc + n_osc + k] = vel;
         float g = gamma[row * n_osc + k];
         float bt = beta[row * n_osc + k];
-        float dp = bank_out[row * 2 * n_osc + k];
-        float dv = bank_out[row * 2 * n_osc + n_osc + k];
+        float s = sense[row * n_osc + k];
+        // Drive with feedback
+        float dp = bank_out[row * 2 * n_osc + k] + fb * prev_out_p;
+        float dv = bank_out[row * 2 * n_osc + n_osc + k] + fb * prev_out_v;
         float old_pos = pos;
         pos = g * (old_pos * cw + vel * sw / f) + (1.0f - g) * bt * dp;
         vel = g * (vel * cw - old_pos * f * sw) + (1.0f - g) * bt * dv;
+        prev_out_p = s * pos;
+        prev_out_v = s * vel;
     }
 
-    // Pass 2: Backward through time
+    // Pass 2: Backward through time (with feedback gradient path)
     float d_pos = 0.0f, d_vel = 0.0f;
+    float d_prev_out_p = 0.0f, d_prev_out_v = 0.0f;
+
     for (int t = seq_len - 1; t >= 0; t--) {
         int row = b * seq_len + t;
         float g = gamma[row * n_osc + k];
         float bt = beta[row * n_osc + k];
         float s = sense[row * n_osc + k];
-        float dp = bank_out[row * 2 * n_osc + k];
-        float dv_bank = bank_out[row * 2 * n_osc + n_osc + k];
         float prev_p = d_bank_out[row * 2 * n_osc + k];
         float prev_v = d_bank_out[row * 2 * n_osc + n_osc + k];
+
+        // Reconstruct prev_out at t-1 for feedback gradient
+        float prev_out_p_t = (t > 0) ? osc_out[(row - 1) * 2 * n_osc + k] : 0.0f;
+        float prev_out_v_t = (t > 0) ? osc_out[(row - 1) * 2 * n_osc + n_osc + k] : 0.0f;
+
+        // Drive with feedback (recomputed)
+        float dp = bank_out[row * 2 * n_osc + k] + fb * prev_out_p_t;
+        float dv_bank = bank_out[row * 2 * n_osc + n_osc + k] + fb * prev_out_v_t;
 
         float cur_p = g * (prev_p * cw + prev_v * sw / f) + (1.0f - g) * bt * dp;
         float cur_v = g * (prev_v * cw - prev_p * f * sw) + (1.0f - g) * bt * dv_bank;
 
         float d_out_p = d_osc_out[row * 2 * n_osc + k];
         float d_out_v = d_osc_out[row * 2 * n_osc + n_osc + k];
+
+        // Gradient from downstream + feedback from t+1
+        d_out_p += d_prev_out_p;
+        d_out_v += d_prev_out_v;
 
         d_sense[row * n_osc + k] = d_out_p * cur_p + d_out_v * cur_v;
         d_pos += d_out_p * s;
@@ -651,28 +681,46 @@ __global__ void k_rotation_scan_bwd(
         d_gamma[row * n_osc + k] = d_pos * (rot_p - bt * dp) + d_vel * (rot_v - bt * dv_bank);
         d_beta[row * n_osc + k] = d_pos * (1.0f - g) * dp + d_vel * (1.0f - g) * dv_bank;
 
-        d_bank_out[row * 2 * n_osc + k] = d_pos * (1.0f - g) * bt;
-        d_bank_out[row * 2 * n_osc + n_osc + k] = d_vel * (1.0f - g) * bt;
+        // d_drive = (1-g) * bt * d_state
+        float d_dp = d_pos * (1.0f - g) * bt;
+        float d_dv = d_vel * (1.0f - g) * bt;
 
+        // d_bank_out = d_drive (feedback doesn't affect bank_out gradient)
+        d_bank_out[row * 2 * n_osc + k] = d_dp;
+        d_bank_out[row * 2 * n_osc + n_osc + k] = d_dv;
+
+        // d_feedback += d_drive * prev_out (the feedback gradient!)
+        d_fb_accum += d_dp * prev_out_p_t + d_dv * prev_out_v_t;
+
+        // d_prev_out for feedback path to t-1 (THIS is the gradient highway)
+        d_prev_out_p = d_dp * fb;
+        d_prev_out_v = d_dv * fb;
+
+        // d_state through rotation (the decaying path)
         float new_d_pos = d_pos * g * cw - d_vel * g * f * sw;
         float new_d_vel = d_pos * g * sw / f + d_vel * g * cw;
         d_pos = new_d_pos;
         d_vel = new_d_vel;
     }
+
+    // Write accumulated feedback gradient
+    atomicAdd(&d_feedback[k], d_fb_accum);
 }
 
 extern "C" void gpu_rotation_scan_bwd(
     const float* gamma, const float* beta, const float* sense,
     const float* bank_out, const float* osc_out, const float* d_osc_out,
     float* d_gamma, float* d_beta, float* d_sense, float* d_bank_out,
+    float* d_feedback,
     const float* cos_w, const float* sin_w, const float* freqs,
+    const float* feedback,
     int batch_size, int seq_len, int n_osc)
 {
     int n = batch_size * n_osc;
     k_rotation_scan_bwd<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(
         gamma, beta, sense, bank_out, osc_out, d_osc_out,
-        d_gamma, d_beta, d_sense, d_bank_out,
-        cos_w, sin_w, freqs, batch_size, seq_len, n_osc);
+        d_gamma, d_beta, d_sense, d_bank_out, d_feedback,
+        cos_w, sin_w, freqs, feedback, batch_size, seq_len, n_osc);
 }
 
 /* ---- Sigmoid ---- */
