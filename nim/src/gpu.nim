@@ -126,6 +126,28 @@ proc gpuSgemm*(op: int, m, n, k: int, a, b, c: GpuBuf) =
 proc sync*() =
   discard cudaDeviceSynchronize()
 
+proc gpuMonarchGrad*(dOutput: GpuBuf, input: GpuBuf, dFactor: GpuBuf,
+                     nBlocks, blockSize, batchRows: int) =
+  ## Accumulate block-diagonal gradient: dFactor[block] += sum_row dOutput[row,block_slice]^T @ input[row,block_slice]
+  ## dFactor: (nBlocks, blockSize, blockSize)
+  ## dOutput, input: (batchRows, nBlocks * blockSize)
+  var alpha: cfloat = 1.0
+  var beta: cfloat = 1.0  # accumulate
+  let s = blockSize.cint
+  let n = batchRows.cint
+  let stride = (nBlocks * blockSize).cint
+  # For each block b: dFactor[b] += dOutput[:, b*s:(b+1)*s]^T @ input[:, b*s:(b+1)*s]
+  # Col-major: dFactor[b] = input_chunk^T @ dOutput_chunk (swapped for row-major)
+  discard cublasSgemmStridedBatched(gCublas,
+    CublasOpN, CublasOpT,  # col-major: compute input^T @ dOutput
+    s, s, n,                # m=blockSize, n=blockSize, k=batchRows
+    addr alpha,
+    dOutput.data, stride, clonglong(s),  # A = dOutput chunks
+    input.data, stride, clonglong(s),    # B = input chunks
+    addr beta,
+    dFactor.data, s, clonglong(s * s),   # C = dFactor blocks (accumulated)
+    nBlocks.cint)
+
 proc gpuMonarchMul*(factor: GpuBuf, input: GpuBuf, output: GpuBuf,
                     nBlocks, blockSize, batchRows: int, accumulate: bool = false) =
   ## Block-diagonal matmul: output[row, block*blockSize + j] = sum_k factor[block, j, k] * input[row, block*blockSize + k]

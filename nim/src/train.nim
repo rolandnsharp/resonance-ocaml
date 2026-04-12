@@ -196,20 +196,27 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
       let lyb = m.layers[l]
       let nbb = lyb.nBlocks
       let bsb = lyb.blockSize
-      # Forward through L for caching: oscOut → L×oscOut (recompute into dOscOutBuf as scratch)
-      gpuMonarchMul(lyb.monarchL.w, oscOutBuf, dOscOutBuf, nbb, bsb, BT)
-      # Permute L×oscOut
-      gpu_monarch_permute(dOscOutBuf.data, actBuf.data, nbb.cint, bsb.cint, BT.cint)
-      # dR: gradient for R factor. dR += (P×L×oscOut)^T @ dMix — use batched outer product
-      # For now: approximate with gpuMonarchMul accumulate (treat dMix as the "gradient output")
-      # TODO: proper block-diagonal gradient accumulation
-      # dAfterR = dMix @ R^T
+
+      # Recompute forward intermediates for gradient
+      # intermediate = L × oscOut
+      gpuMonarchMul(lyb.monarchL.w, oscOutBuf, actBuf, nbb, bsb, BT)
+      # permuted = P × intermediate
+      gpu_monarch_permute(actBuf.data, dOscOutBuf.data, nbb.cint, bsb.cint, BT.cint)
+      # dOscOutBuf now holds "permuted" (the input to R)
+
+      # dR += permuted^T @ dMixed (per-block outer product)
+      gpuMonarchGrad(dMixBuf, dOscOutBuf, lyb.monarchR.g, nbb, bsb, BT)
+
+      # dPermuted = dMixed @ R^T (gradient through R)
       gpuMonarchMul(lyb.monarchR.w, dMixBuf, dOscOutBuf, nbb, bsb, BT)
-      # Note: gpuMonarchMul does x @ factor^T — so this gives dMix @ R^T. But we want the blocks.
-      # This is approximate — proper backward needs per-block outer products.
-      # Inverse permute
+
+      # dIntermediate = P^{-1} × dPermuted (inverse permute)
       gpu_monarch_permute_inv(dOscOutBuf.data, dMixBuf.data, nbb.cint, bsb.cint, BT.cint)
-      # dOscOut = d(L×oscOut) @ L^T
+
+      # dL += oscOut^T @ dIntermediate (per-block outer product)
+      gpuMonarchGrad(dMixBuf, oscOutBuf, lyb.monarchL.g, nbb, bsb, BT)
+
+      # dOscOut = dIntermediate @ L^T (gradient through L)
       gpuMonarchMul(lyb.monarchL.w, dMixBuf, dOscOutBuf, nbb, bsb, BT)
 
       # Through rotation scan backward
