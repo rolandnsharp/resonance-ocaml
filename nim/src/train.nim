@@ -74,6 +74,8 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
   let convPosBuf = gpuCreate(totalOsc * fftLen)
   let convVelBuf = gpuCreate(totalOsc * fftLen)
 
+  let gradNormBuf = gpuCreate(1)  # scalar for gradient norm accumulation
+
   let t0 = epochTime()
 
   for step in 0..<steps:
@@ -86,7 +88,14 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
     tokBuf.gpuUploadInts(tokData)
     tgtBuf.gpuUploadInts(tgtData)
 
-    let s = if step < 200: step.float32 / 200.0 else: 1.0
+    # Cosine schedule: warmup → peak → warmdown
+    let warmup = 200
+    let warmdownStart = steps - steps div 5
+    let s = if step < warmup: step.float32 / warmup.float32
+            elif step >= warmdownStart:
+              let progress = (step - warmdownStart).float32 / (steps - warmdownStart).float32
+              0.5 * (1.0 + cos(PI * progress))
+            else: 1.0
     let curLr = lr * s
 
     # === Forward ===
