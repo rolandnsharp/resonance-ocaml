@@ -22,7 +22,13 @@ type
     projGamma*: Param    # dim → n_osc (damping control)
     projBeta*: Param     # dim → n_osc (absorption control)
     projSense*: Param    # dim → n_osc (readout sensitivity)
-    wMix*: Param         # dim × dim (spectral recombination)
+    wMix*: Param         # dim × dim (spectral recombination) — or Monarch factored
+    # Monarch factors: two block-diagonal matrices, each nBlocks × blockSize × blockSize
+    monarchL*: Param     # left factor: nBlocks × blockSize × blockSize
+    monarchR*: Param     # right factor: nBlocks × blockSize × blockSize
+    useMonarch*: bool    # if true, use Monarch instead of dense wMix
+    nBlocks*: int
+    blockSize*: int
     mixScale*: Param     # dim (residual scaling)
 
   Model* = object
@@ -87,7 +93,19 @@ proc createModel*(nOsc, nLayers, vocabSize, seqLen: int): Model =
     result.layers[l].projGamma = initParam(dim * nOsc, projScale)
     result.layers[l].projBeta = initParam(dim * nOsc, projScale)
     result.layers[l].projSense = initParam(dim * nOsc, projScale)
-    result.layers[l].wMix = initParam(dim * dim, scale)
+    # Monarch: find best block factorization of dim
+    var bestBlock = 1
+    for s in 2..dim:
+      if dim mod s == 0 and s * s <= dim * 2:
+        bestBlock = s
+    let nBlocks = dim div bestBlock
+    result.layers[l].nBlocks = nBlocks
+    result.layers[l].blockSize = bestBlock
+    result.layers[l].useMonarch = true
+    let monarchScale = 1.0 / sqrt(bestBlock.float32)
+    result.layers[l].monarchL = initParam(nBlocks * bestBlock * bestBlock, monarchScale)
+    result.layers[l].monarchR = initParam(nBlocks * bestBlock * bestBlock, monarchScale)
+    result.layers[l].wMix = initParam(0)  # unused when Monarch is active
     result.layers[l].mixScale = initParam(dim, 0.0)
     # Init mixScale to ones
     var ones = newSeq[float32](dim)

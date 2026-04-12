@@ -42,6 +42,14 @@ proc cublasSgemm*(handle: CublasHandle, transa, transb: CublasOperation,
     m, n, k: cint, alpha: ptr cfloat, a: pointer, lda: cint,
     b: pointer, ldb: cint, beta: ptr cfloat, c: pointer, ldc: cint): CublasStatus
   {.importc: "cublasSgemm_v2", header: "<cublas_v2.h>".}
+proc cublasSgemmStridedBatched*(handle: CublasHandle,
+    transa, transb: CublasOperation,
+    m, n, k: cint, alpha: ptr cfloat,
+    a: pointer, lda: cint, strideA: clonglong,
+    b: pointer, ldb: cint, strideB: clonglong,
+    beta: ptr cfloat, c: pointer, ldc: cint, strideC: clonglong,
+    batchCount: cint): CublasStatus
+  {.importc: "cublasSgemmStridedBatched", header: "<cublas_v2.h>".}
 
 # ── GPU Buffer ────────────────────────────────────────────────────
 
@@ -118,6 +126,30 @@ proc gpuSgemm*(op: int, m, n, k: int, a, b, c: GpuBuf) =
 proc sync*() =
   discard cudaDeviceSynchronize()
 
+proc gpuMonarchMul*(factor: GpuBuf, input: GpuBuf, output: GpuBuf,
+                    nBlocks, blockSize, batchRows: int, accumulate: bool = false) =
+  ## Block-diagonal matmul: output[row, block*blockSize + j] = sum_k factor[block, j, k] * input[row, block*blockSize + k]
+  ## factor: (nBlocks, blockSize, blockSize) — the block-diagonal weights
+  ## input: (batchRows, nBlocks * blockSize) — viewed as (batchRows, nBlocks, blockSize)
+  ## output: same shape
+  ## Uses cublasSgemmStridedBatched for one-call execution.
+  var alpha: cfloat = 1.0
+  var beta: cfloat = if accumulate: 1.0 else: 0.0
+  let s = blockSize.cint
+  let n = batchRows.cint
+  # Row-major → col-major trick: swap A/B
+  # We want: for each block b: out[:, b*s:(b+1)*s] = input[:, b*s:(b+1)*s] @ factor[b]^T
+  # Col-major: C = B^T @ A where B = factor[b], A = input chunk
+  discard cublasSgemmStridedBatched(gCublas,
+    CublasOpT, CublasOpN,  # transA=T (factor transposed), transB=N
+    s, n, s,                 # m=blockSize, n=batchRows, k=blockSize
+    addr alpha,
+    factor.data, s, clonglong(s * s),     # A = factor blocks, stride = blockSize²
+    input.data, (nBlocks * blockSize).cint, clonglong(s),  # B = input, stride between blocks = blockSize
+    addr beta,
+    output.data, (nBlocks * blockSize).cint, clonglong(s), # C = output
+    nBlocks.cint)
+
 # ── Kernel bindings ───────────────────────────────────────────────
 
 proc gpu_embed_fwd*(ids, table, output: pointer, dim, n: cint) {.importc, cdecl.}
@@ -157,6 +189,10 @@ proc gpu_bank_gather*(drives, columns: pointer,
     batchSize, seqLen, n_osc, fft_len: cint) {.importc, cdecl.}
 proc gpu_strided_gather*(src, dst: pointer,
     rows, stride, n_osc, col_offset: cint) {.importc, cdecl.}
+proc gpu_monarch_permute*(input, output: pointer,
+    nBlocks, blockSize, rows: cint) {.importc, cdecl.}
+proc gpu_monarch_permute_inv*(input, output: pointer,
+    nBlocks, blockSize, rows: cint) {.importc, cdecl.}
 proc gpu_rotation_scan*(gamma, beta, sense, bank_out, osc_out: pointer,
     cos_w, sin_w, freqs: pointer,
     batch_size, seq_len, n_osc: cint) {.importc, cdecl.}

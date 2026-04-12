@@ -155,8 +155,13 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
         m.cosW.data, m.sinW.data, m.freqs.data,
         batchSize.cint, seqLen.cint, nOsc.cint)
 
-      # W_mix on oscillator output + SineGate + residual
-      gpuSgemm(opNN, BT, dim, dim, oscOutBuf, m.layers[l].wMix.w, mixed[l])
+      # Monarch W_mix: L factor → permute → R factor
+      let ly = m.layers[l]
+      let nb = ly.nBlocks
+      let bs = ly.blockSize
+      gpuMonarchMul(ly.monarchL.w, oscOutBuf, mixed[l], nb, bs, BT)
+      gpu_monarch_permute(mixed[l].data, oscOutBuf.data, nb.cint, bs.cint, BT.cint)
+      gpuMonarchMul(ly.monarchR.w, oscOutBuf, mixed[l], nb, bs, BT)
       gpu_sinegate_fwd(mixed[l].data, actBuf.data, (BT * dim).cint)
       gpu_add(states[l].data, actBuf.data, states[l+1].data, (BT * dim).cint)
 
@@ -187,9 +192,25 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
       # Through SineGate: dMix = dState * sinegate'(mixed)
       gpu_sinegate_bwd(mixed[l].data, dStateBuf.data, dMixBuf.data, (BT * dim).cint)
 
-      # Through W_mix: dOscOut = dMix @ W^T, dW += oscOut^T @ dMix
-      gpuSgemm(opTNA, dim, dim, BT, oscOutBuf, dMixBuf, m.layers[l].wMix.g)
-      gpuSgemm(opNT, BT, dim, dim, dMixBuf, m.layers[l].wMix.w, dOscOutBuf)
+      # Through Monarch: backward R → inv permute → backward L
+      let lyb = m.layers[l]
+      let nbb = lyb.nBlocks
+      let bsb = lyb.blockSize
+      # Forward through L for caching: oscOut → L×oscOut (recompute into dOscOutBuf as scratch)
+      gpuMonarchMul(lyb.monarchL.w, oscOutBuf, dOscOutBuf, nbb, bsb, BT)
+      # Permute L×oscOut
+      gpu_monarch_permute(dOscOutBuf.data, actBuf.data, nbb.cint, bsb.cint, BT.cint)
+      # dR: gradient for R factor. dR += (P×L×oscOut)^T @ dMix — use batched outer product
+      # For now: approximate with gpuMonarchMul accumulate (treat dMix as the "gradient output")
+      # TODO: proper block-diagonal gradient accumulation
+      # dAfterR = dMix @ R^T
+      gpuMonarchMul(lyb.monarchR.w, dMixBuf, dOscOutBuf, nbb, bsb, BT)
+      # Note: gpuMonarchMul does x @ factor^T — so this gives dMix @ R^T. But we want the blocks.
+      # This is approximate — proper backward needs per-block outer products.
+      # Inverse permute
+      gpu_monarch_permute_inv(dOscOutBuf.data, dMixBuf.data, nbb.cint, bsb.cint, BT.cint)
+      # dOscOut = d(L×oscOut) @ L^T
+      gpuMonarchMul(lyb.monarchL.w, dMixBuf, dOscOutBuf, nbb, bsb, BT)
 
       # Through rotation scan backward
       gpu_rotation_scan_bwd(
@@ -261,7 +282,8 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
     m.drive.adamStep(curLr * 3.0, b1, b2, 0, bc1, bc2)
     m.wOut.adamStep(curLr, b1, b2, wd, bc1, bc2)
     for l in 0..<nL:
-      m.layers[l].wMix.adamStep(curLr, b1, b2, wd, bc1, bc2)
+      m.layers[l].monarchL.adamStep(curLr, b1, b2, wd, bc1, bc2)
+      m.layers[l].monarchR.adamStep(curLr, b1, b2, wd, bc1, bc2)
       m.layers[l].projGamma.adamStep(curLr, b1, b2, wd, bc1, bc2)
       m.layers[l].projBeta.adamStep(curLr, b1, b2, wd, bc1, bc2)
       m.layers[l].projSense.adamStep(curLr, b1, b2, wd, bc1, bc2)

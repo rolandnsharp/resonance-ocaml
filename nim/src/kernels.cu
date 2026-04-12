@@ -337,6 +337,48 @@ extern "C" void gpu_strided_gather(const float* src, float* dst,
     k_strided_gather<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(src, dst, rows, stride, n_osc, col_offset, 0);
 }
 
+/* ---- Monarch permutation: reshape(nBlocks, blockSize) → transpose → reshape(dim) ---- */
+
+__global__ void k_monarch_permute(const float* in, float* out,
+                                   int nBlocks, int blockSize, int rows) {
+    // For each row (BT), permute dim elements
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * nBlocks * blockSize;
+    if (idx >= total) return;
+    int row = idx / (nBlocks * blockSize);
+    int d = idx % (nBlocks * blockSize);
+    int block = d / blockSize;
+    int pos = d % blockSize;
+    // Transpose: (block, pos) → (pos, block)
+    int new_d = pos * nBlocks + block;
+    out[row * nBlocks * blockSize + new_d] = in[idx];
+}
+
+__global__ void k_monarch_permute_inv(const float* in, float* out,
+                                       int nBlocks, int blockSize, int rows) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * nBlocks * blockSize;
+    if (idx >= total) return;
+    int row = idx / (nBlocks * blockSize);
+    int d = idx % (nBlocks * blockSize);
+    // Inverse transpose: (pos, block) → (block, pos)
+    int pos = d / nBlocks;
+    int block = d % nBlocks;
+    int new_d = block * blockSize + pos;
+    out[row * nBlocks * blockSize + new_d] = in[idx];
+}
+
+extern "C" void gpu_monarch_permute(const float* in, float* out,
+                                     int nBlocks, int blockSize, int rows) {
+    int n = rows * nBlocks * blockSize;
+    k_monarch_permute<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(in, out, nBlocks, blockSize, rows);
+}
+extern "C" void gpu_monarch_permute_inv(const float* in, float* out,
+                                         int nBlocks, int blockSize, int rows) {
+    int n = rows * nBlocks * blockSize;
+    k_monarch_permute_inv<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(in, out, nBlocks, blockSize, rows);
+}
+
 /* ---- Element-wise add: y = a + b ---- */
 
 __global__ void k_add(const float* a, const float* b, float* y, int n) {
