@@ -540,20 +540,15 @@ __global__ void k_rotation_scan(
     const float* gamma, const float* beta, const float* sense,
     const float* bank_out, float* osc_out,
     const float* cos_w, const float* sin_w, const float* freqs,
-    const float* fm_depth,  // per-oscillator FM modulation depth
-    int batch_size, int seq_len, int n_osc, int fold_offset)
+    int batch_size, int seq_len, int n_osc)
 {
-    // Each thread handles one (batch, oscillator) pair across all timesteps
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= batch_size * n_osc) return;
     int b = idx / n_osc;
     int k = idx % n_osc;
-    int partner = (k + fold_offset) % n_osc;  // FM modulator
 
     float pos = 0.0f, vel = 0.0f;
-    float f_base = freqs[k];
-    float fm_beta = fm_depth[k];
-    float partner_pos = 0.0f;  // track partner's state for FM
+    float cw = cos_w[k], sw = sin_w[k], f = freqs[k];
 
     for (int t = 0; t < seq_len; t++) {
         int row = b * seq_len + t;
@@ -562,20 +557,6 @@ __global__ void k_rotation_scan(
         float s = sense[row * n_osc + k];
         float dp = bank_out[row * 2 * n_osc + k];
         float dv = bank_out[row * 2 * n_osc + n_osc + k];
-
-        // Read partner's amplitude for FM modulation
-        // Use the PREVIOUS timestep's osc_out (already written by partner's thread)
-        // For t=0, partner_pos=0. For t>0, read from osc_out at t-1.
-        if (t > 0) {
-            int prev_row = b * seq_len + (t - 1);
-            partner_pos = osc_out[prev_row * 2 * n_osc + partner];
-        }
-
-        // FM: modulate frequency by partner's amplitude
-        float f_eff = f_base + fm_beta * partner_pos;
-        float cw = cosf(f_eff);
-        float sw = sinf(f_eff);
-        float f = fmaxf(fabsf(f_eff), 0.01f);  // prevent division by zero
 
         float new_pos = g * (pos * cw + vel * sw / f) + (1.0f - g) * bt * dp;
         float new_vel = g * (vel * cw - pos * f * sw) + (1.0f - g) * bt * dv;
@@ -591,14 +572,12 @@ extern "C" void gpu_rotation_scan(
     const float* gamma, const float* beta, const float* sense,
     const float* bank_out, float* osc_out,
     const float* cos_w, const float* sin_w, const float* freqs,
-    const float* fm_depth,
-    int batch_size, int seq_len, int n_osc, int fold_offset)
+    int batch_size, int seq_len, int n_osc)
 {
     int n = batch_size * n_osc;
     k_rotation_scan<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(
         gamma, beta, sense, bank_out, osc_out,
-        cos_w, sin_w, freqs, fm_depth,
-        batch_size, seq_len, n_osc, fold_offset);
+        cos_w, sin_w, freqs, batch_size, seq_len, n_osc);
 }
 
 /* ---- Backward rotation scan ----

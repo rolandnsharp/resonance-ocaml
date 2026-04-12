@@ -158,11 +158,11 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
       gpu_add_bias(senseBuf.data, m.layers[l].projSenseBias.w.data, nOsc.cint, (BT * nOsc).cint)
       gpu_sigmoid(senseBuf.data, senseBuf.data, (BT * nOsc).cint)
 
-      # FM rotation scan: damped rotation + cross-oscillator frequency modulation
+      # Damped rotation scan
       gpu_rotation_scan(gammaBuf.data, betaBuf.data, senseBuf.data,
         states[0].data, oscOutBuf.data,
-        m.cosW.data, m.sinW.data, m.freqs.data, m.layers[l].fmDepth.w.data,
-        batchSize.cint, seqLen.cint, nOsc.cint, m.layers[l].foldOffset.cint)
+        m.cosW.data, m.sinW.data, m.freqs.data,
+        batchSize.cint, seqLen.cint, nOsc.cint)
 
       # Interference: dense W computes all pairwise cross-terms between oscillators
       # spectralRe is repurposed as wMix (dim × dim)
@@ -276,7 +276,6 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
     m.wOut.adamStep(curLr, b1, b2, wd, bc1, bc2)
     for l in 0..<nL:
       m.layers[l].spectralRe.adamStep(curLr, b1, b2, wd, bc1, bc2)  # wMix
-      m.layers[l].fmDepth.adamStep(curLr, b1, b2, 0, bc1, bc2)
       m.layers[l].projGammaBias.adamStep(curLr, b1, b2, 0, bc1, bc2)
       m.layers[l].projBetaBias.adamStep(curLr, b1, b2, 0, bc1, bc2)
       m.layers[l].projSenseBias.adamStep(curLr, b1, b2, 0, bc1, bc2)

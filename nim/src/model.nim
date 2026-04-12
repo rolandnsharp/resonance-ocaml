@@ -27,8 +27,6 @@ type
     spectralIm*: Param   # unused placeholder
     gateProj*: Param     # unused placeholder
     # Projection biases
-    fmDepth*: Param       # per-oscillator FM modulation depth
-    foldOffset*: int      # butterfly partner offset for FM
     projGammaBias*: Param
     projBetaBias*: Param
     projSenseBias*: Param
@@ -100,13 +98,6 @@ proc createModel*(nOsc, nLayers, vocabSize, seqLen: int): Model =
     result.layers[l].spectralRe = initParam(dim * dim, scale)  # reuse field as wMix
     result.layers[l].spectralIm = initParam(0)  # unused
     result.layers[l].gateProj = initParam(0)   # unused
-    # FM synthesis: cross-oscillator frequency modulation
-    result.layers[l].fmDepth = initParam(nOsc, 0.0)  # start at 0 (no FM), learn to add
-    # Butterfly FM partner offset: different per layer for full connectivity
-    var nLevels = 1
-    var tmp = nOsc
-    while tmp > 1: tmp = tmp div 2; inc nLevels
-    result.layers[l].foldOffset = max(1, nOsc shr (1 + (l mod max(1, nLevels))))
     # Projection biases
     result.layers[l].projGammaBias = initParam(nOsc, 0.0)
     result.layers[l].projBetaBias = initParam(nOsc, 0.0)

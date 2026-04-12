@@ -226,8 +226,8 @@ proc gpu_monarch_permute*(input, output: pointer,
 proc gpu_monarch_permute_inv*(input, output: pointer,
     nBlocks, blockSize, rows: cint) {.importc, cdecl.}
 proc gpu_rotation_scan*(gamma, beta, sense, bank_out, osc_out: pointer,
-    cos_w, sin_w, freqs, fm_depth: pointer,
-    batch_size, seq_len, n_osc, fold_offset: cint) {.importc, cdecl.}
+    cos_w, sin_w, freqs: pointer,
+    batch_size, seq_len, n_osc: cint) {.importc, cdecl.}
 proc gpu_rotation_scan_bwd*(gamma, beta, sense, bank_out, osc_out, d_osc_out: pointer,
     d_gamma, d_beta, d_sense, d_bank_out: pointer,
     cos_w, sin_w, freqs: pointer,
