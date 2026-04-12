@@ -481,8 +481,9 @@ __global__ void k_rotation_scan_bwd(
         float bt = beta[row * n_osc + k];
         float dp = bank_out[row * 2 * n_osc + k];
         float dv = bank_out[row * 2 * n_osc + n_osc + k];
-        pos = g * (pos * cw + vel * sw / f) + (1.0f - g) * bt * dp;
-        vel = g * (vel * cw - pos * f * sw) + (1.0f - g) * bt * dv;
+        float old_pos = pos;
+        pos = g * (old_pos * cw + vel * sw / f) + (1.0f - g) * bt * dp;
+        vel = g * (vel * cw - old_pos * f * sw) + (1.0f - g) * bt * dv;
     }
 
     // Pass 2: Backward through time
