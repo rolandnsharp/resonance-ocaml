@@ -1,82 +1,108 @@
-## dsp.nim — Signal processing primitives for Resonance.
+## dsp.nim — Signal processing for Resonance.
 ##
-## Inspired by aitherNim: every operation is a signal transform.
-## Chain with |> for left-to-right data flow:
+## Inspired by aitherNim: every operation is a named signal transform.
+## Uses Nim's UFCS for left-to-right signal chains:
 ##
-##   normed |> project(layer.gamma) |> sigmoid |> gate
+##   drives.propagate(bank, state)
+##   state.normalize(normed)
+##   normed.project(w, bias, gate).activate(gate)
+##   bank.resonate(gamma, beta, sense, oscOut)
+##   oscOut.interfere(w, mixed).harmonics(activated)
+##   state.superpose(activated, nextState)
 ##
-## Each function takes a Signal (GPU buffer + shape) and returns a Signal.
-## Allocation is explicit — no hidden mallocs in the signal chain.
+## No hidden allocations. Every buffer is pre-allocated.
+## This is the aither way: explicit state, pipeline flow.
 
 import gpu
 
 type
-  Signal* = object
-    ## A signal on the GPU: a buffer with known shape.
-    buf*: GpuBuf
-    rows*: int    ## batch × seq_len (or batch for per-step ops)
-    cols*: int    ## feature dimension
+  Buf* = GpuBuf  ## Alias — a signal is just a GPU buffer with a name
 
-  Projection* = object
-    ## A learned linear projection: weight + optional bias.
-    w*: GpuBuf
-    bias*: GpuBuf
-    hasBias*: bool
-    inDim*, outDim*: int
+# ── Propagation: FFT bank encoding ──
 
-  Interference* = object
-    ## Dense W for pairwise cross-terms.
-    w*: GpuBuf
-    dim*: int
+proc propagate*(drives, columns, colsFft, prodPos, prodVel, convPos, convVel: Buf,
+                hPosFft, hVelFft: Buf, state: Buf,
+                batchSize, seqLen, nOsc, dim, fftLen, fftCLen, totalOsc: int) =
+  ## Token drives → FFT convolve with oscillator impulse responses → state
+  ## The bank IS the physics: h(t) = e^{-γt} sin(ωd·t) / ωd
+  let inv = 1.0 / fftLen.float32
+  state.gpuZero()
+  columns.gpuZero()
+  gpu_bank_gather(drives.data, columns.data,
+    batchSize.cint, seqLen.cint, nOsc.cint, fftLen.cint)
+  discard gpu_fft_r2c_batched(columns.data, colsFft.data, fftLen.cint, totalOsc.cint)
+  gpu_complex_mul_broadcast(colsFft.data, hPosFft.data, prodPos.data,
+    (nOsc * fftCLen).cint, (totalOsc * fftCLen).cint)
+  gpu_complex_mul_broadcast(colsFft.data, hVelFft.data, prodVel.data,
+    (nOsc * fftCLen).cint, (totalOsc * fftCLen).cint)
+  discard gpu_fft_c2r_batched(prodPos.data, convPos.data, fftLen.cint, totalOsc.cint)
+  discard gpu_fft_c2r_batched(prodVel.data, convVel.data, fftLen.cint, totalOsc.cint)
+  gpu_bank_scatter(convPos.data, state.data,
+    batchSize.cint, seqLen.cint, nOsc.cint, dim.cint, 0.cint, inv.cfloat)
+  gpu_bank_scatter(convVel.data, state.data,
+    batchSize.cint, seqLen.cint, nOsc.cint, dim.cint, nOsc.cint, inv.cfloat)
 
-# --- Signal constructors ---
+# ── Normalization ──
 
-proc signal*(buf: GpuBuf, rows, cols: int): Signal =
-  Signal(buf: buf, rows: rows, cols: cols)
+proc normalize*(input, output: Buf, dim, rows: int) =
+  ## RMSNorm: scale to unit energy
+  gpu_rmsnorm(input.data, output.data, dim.cint, rows.cint)
 
-proc numel*(s: Signal): int = s.rows * s.cols
+# ── Projection + activation ──
 
-# --- Core operations ---
+proc project*(input, weights, output: Buf, rows, outDim, inDim: int) =
+  ## Linear projection: output = input @ weights
+  gpuSgemm(0, rows, outDim, inDim, input, weights, output)
 
-proc rmsNorm*(input: Signal, output: Signal): Signal =
-  ## RMSNorm across feature dimension.
-  gpu_rmsnorm(input.buf.data, output.buf.data, input.cols.cint, input.rows.cint)
-  result = output
+proc addBias*(signal, bias: Buf, cols, n: int) =
+  ## Add per-column bias
+  gpu_add_bias(signal.data, bias.data, cols.cint, n.cint)
 
-proc project*(input: Signal, proj: Projection, output: Signal): Signal =
-  ## Linear projection: output = input @ W + bias
-  gpuSgemm(0, input.rows, proj.outDim, proj.inDim, input.buf, proj.w, output.buf)
-  if proj.hasBias:
-    gpu_add_bias(output.buf.data, proj.bias.data, proj.outDim.cint, (input.rows * proj.outDim).cint)
-  result = output
+proc activate*(signal: Buf, n: int) =
+  ## Sigmoid: squash to (0, 1) — the gate opens/closes
+  gpu_sigmoid(signal.data, signal.data, n.cint)
 
-proc sigmoid*(input: Signal): Signal =
-  ## In-place sigmoid.
-  gpu_sigmoid(input.buf.data, input.buf.data, input.numel.cint)
-  result = input
+# ── Resonance: damped rotation ──
 
-proc sineGate*(input: Signal, output: Signal): Signal =
-  ## x * sin(x) — harmonic nonlinearity.
-  gpu_sinegate_fwd(input.buf.data, output.buf.data, input.numel.cint)
-  result = output
+proc resonate*(gamma, beta, sense, bankOut, oscOut: Buf,
+               cosW, sinW, freqs: Buf,
+               batchSize, seqLen, nOsc: int) =
+  ## Damped rotation scan: the oscillator equation
+  ## pos' = γ·(pos·cos(ω) + vel·sin(ω)/ω) + (1-γ)·β·drive
+  ## vel' = γ·(vel·cos(ω) - pos·ω·sin(ω)) + (1-γ)·β·drive
+  gpu_rotation_scan(gamma.data, beta.data, sense.data,
+    bankOut.data, oscOut.data,
+    cosW.data, sinW.data, freqs.data,
+    batchSize.cint, seqLen.cint, nOsc.cint)
 
-proc interfere*(input: Signal, w: Interference, output: Signal): Signal =
-  ## Dense W: compute all pairwise interference cross-terms.
-  gpuSgemm(0, input.rows, w.dim, w.dim, input.buf, w.w, output.buf)
-  result = output
+# ── Interference: pairwise cross-terms ──
 
-proc superpose*(a, b: Signal, output: Signal): Signal =
-  ## Residual add: superposition of two signals.
-  gpu_add(a.buf.data, b.buf.data, output.buf.data, a.numel.cint)
-  result = output
+proc interfere*(input, weights, output: Buf, rows, dim: int) =
+  ## Dense W: |A + B|² = |A|² + |B|² + 2·Re(A·conj(B))
+  ## The cross-terms ARE the pairwise interactions
+  gpuSgemm(0, rows, dim, dim, input, weights, output)
 
-proc scale*(input: Signal, factor: float32): Signal =
-  ## Scale signal amplitude.
-  gpu_scale_array(input.buf.data, factor, input.numel.cint)
-  result = input
+# ── Harmonics: wave nonlinearity ──
 
-# --- Pipe operator ---
+proc harmonics*(input, output: Buf, n: int) =
+  ## SineGate: x × sin(x) — generates overtones like an overdriven oscillator
+  gpu_sinegate_fwd(input.data, output.data, n.cint)
 
-template `|>`*(input: Signal, call: untyped): Signal =
-  ## Pipe operator for signal chains.
-  call
+# ── Superposition: residual add ──
+
+proc superpose*(a, b, output: Buf, n: int) =
+  ## Waves add: the principle of superposition
+  gpu_add(a.data, b.data, output.data, n.cint)
+
+# ── Strike: token → oscillator excitation ──
+
+proc strike*(tokens, driveTable, drives: Buf, dim, n: int) =
+  ## Each token strikes the oscillator bank like a hammer hitting bells
+  gpu_embed_fwd(tokens.data, driveTable.data, drives.data, dim.cint, n.cint)
+
+# ── Listen: oscillator state → prediction ──
+
+proc listen*(state, weights, logits: Buf, rows, vocabSize, dim: int) =
+  ## Dot product with drive signatures — weight-tied readout
+  ## The same resonance patterns used to strike are used to listen
+  gpuSgemm(0, rows, vocabSize, dim, state, weights, logits)
