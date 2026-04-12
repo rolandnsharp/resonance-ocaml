@@ -698,11 +698,18 @@ __global__ void k_ce_loss(const float* logits, const int* targets,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float* row = logits + i * vocab;
-    float mx = row[0];
-    for (int j = 1; j < vocab; j++) mx = fmaxf(mx, row[j]);
+    float mx = -1e20f;
+    for (int j = 0; j < vocab; j++) {
+        float v = fmaxf(fminf(row[j], 30.0f), -30.0f);  // clamp to prevent exp overflow
+        mx = fmaxf(mx, v);
+    }
     float sum = 0.0f;
-    for (int j = 0; j < vocab; j++) sum += expf(row[j] - mx);
-    losses[i] = -(row[targets[i]] - mx - logf(sum));
+    for (int j = 0; j < vocab; j++) {
+        float v = fmaxf(fminf(row[j], 30.0f), -30.0f);
+        sum += expf(v - mx);
+    }
+    float target_logit = fmaxf(fminf(row[targets[i]], 30.0f), -30.0f);
+    losses[i] = -(target_logit - mx - logf(fmaxf(sum, 1e-10f)));
 }
 
 __global__ void k_ce_backward(const float* logits, const int* targets,
@@ -711,11 +718,12 @@ __global__ void k_ce_backward(const float* logits, const int* targets,
     if (idx >= n * vocab) return;
     int i = idx / vocab, j = idx % vocab;
     const float* row = logits + i * vocab;
-    float mx = row[0];
-    for (int k = 1; k < vocab; k++) mx = fmaxf(mx, row[k]);
+    float mx = -1e20f;
+    for (int k = 0; k < vocab; k++) mx = fmaxf(mx, fmaxf(fminf(row[k], 30.0f), -30.0f));
+    float val = fmaxf(fminf(row[j], 30.0f), -30.0f);
     float sum = 0.0f;
-    for (int k = 0; k < vocab; k++) sum += expf(row[k] - mx);
-    float prob = expf(row[j] - mx) / sum;
+    for (int k = 0; k < vocab; k++) sum += expf(fmaxf(fminf(row[k], 30.0f), -30.0f) - mx);
+    float prob = expf(val - mx) / fmaxf(sum, 1e-10f);
     dlogits[idx] = (prob - (j == targets[i] ? 1.0f : 0.0f)) / (float)n;
 }
 
