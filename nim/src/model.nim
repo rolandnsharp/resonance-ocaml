@@ -116,6 +116,54 @@ proc createModel*(nOsc, nLayers, vocabSize, seqLen: int): Model =
     nLayers * (3 * dim * nOsc + dim * dim + dim)
   echo &"Parameters: {nParams}"
 
+  # Precompute impulse response FFTs for the bank
+  let fftLen = 2 * seqLen
+  let fftCLen = fftLen div 2 + 1  # complex output length of R2C
+  var hPos = newSeq[float32](seqLen)
+  var hVel = newSeq[float32](seqLen)
+  var padded = newSeq[float32](fftLen)
+
+  # We'll store all kernel FFTs as interleaved (re, im) pairs
+  # hPosFft: nOsc * fftCLen * 2 floats
+  result.hPosFft = gpuCreate(nOsc * fftCLen * 2)
+  result.hVelFft = gpuCreate(nOsc * fftCLen * 2)
+
+  let tmpReal = gpuCreate(fftLen)
+  let tmpComplex = gpuCreate(fftCLen * 2)
+
+  for k in 0..<nOsc:
+    let w0 = freqData[k]
+    let g = 0.05 + 0.15 * k.float32 / max(1, nOsc - 1).float32
+    let wd = w0 * sqrt(max(1e-6, 1.0 - g * g))
+    let alpha = g * w0
+    for i in 0..<seqLen:
+      let t = i.float32
+      let decay = exp(-alpha * t)
+      hPos[i] = decay * sin(wd * t) / max(1e-8, wd)
+      hVel[i] = decay * (cos(wd * t) - alpha / max(1e-8, wd) * sin(wd * t))
+    # Pad and FFT
+    for i in 0..<fftLen: padded[i] = if i < seqLen: hPos[i] else: 0.0
+    tmpReal.gpuUpload(padded)
+    discard gpu_fft_r2c_batched(tmpReal.data, tmpComplex.data, fftLen.cint, 1.cint)
+    # Copy to the k-th slot in hPosFft
+    var complexData = gpuDownload(tmpComplex)
+    var allData = gpuDownload(result.hPosFft)
+    for i in 0..<fftCLen * 2:
+      allData[k * fftCLen * 2 + i] = complexData[i]
+    result.hPosFft.gpuUpload(allData)
+
+    # Same for velocity
+    for i in 0..<fftLen: padded[i] = if i < seqLen: hVel[i] else: 0.0
+    tmpReal.gpuUpload(padded)
+    discard gpu_fft_r2c_batched(tmpReal.data, tmpComplex.data, fftLen.cint, 1.cint)
+    complexData = gpuDownload(tmpComplex)
+    allData = gpuDownload(result.hVelFft)
+    for i in 0..<fftCLen * 2:
+      allData[k * fftCLen * 2 + i] = complexData[i]
+    result.hVelFft.gpuUpload(allData)
+
+  echo &"Bank: {nOsc} oscillators, fftLen={fftLen}"
+
 proc countParams*(m: Model): int =
   result = m.drive.n + m.wOut.n
   for l in m.layers:

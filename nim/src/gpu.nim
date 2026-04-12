@@ -1,7 +1,7 @@
 ## gpu.nim — CUDA bindings for Resonance.
 ## Based on nimllm/gpu.nim patterns.
 
-{.passL: "src/kernels.o -lcudart -lcublas -lstdc++".}
+{.passL: "src/kernels.o -lcudart -lcublas -lcufft -lstdc++".}
 
 # ── CUDA types ────────────────────────────────────────────────────
 
@@ -123,6 +123,9 @@ proc sync*() =
 proc gpu_embed_fwd*(ids, table, output: pointer, dim, n: cint) {.importc, cdecl.}
 proc gpu_embed_bwd*(ids, dout, dtable: pointer, dim, n: cint) {.importc, cdecl.}
 proc gpu_rmsnorm*(x, output: pointer, dim, n: cint) {.importc, cdecl.}
+proc gpu_rmsnorm_bwd*(x, dout, dx: pointer, dim, n: cint) {.importc, cdecl.}
+proc gpu_add*(a, b, y: pointer, n: cint) {.importc, cdecl.}
+proc gpu_add_inplace*(a, b: pointer, n: cint) {.importc, cdecl.}
 proc gpu_sinegate_fwd*(x, output: pointer, n: cint) {.importc, cdecl.}
 proc gpu_sinegate_bwd*(x, dout, dx: pointer, n: cint) {.importc, cdecl.}
 proc gpu_rotation_step*(pos, vel, gamma, beta, drive: pointer,
@@ -139,3 +142,15 @@ proc gpu_adamw*(param, grad, m, v: pointer,
     lr, b1, b2, wd, bc1, bc2: cfloat, n: cint) {.importc, cdecl.}
 proc gpu_grad_norm*(grad, output: pointer, n: cint) {.importc, cdecl.}
 proc gpu_scale*(x: pointer, s: cfloat, n: cint) {.importc, cdecl.}
+proc gpu_complex_mul*(a, b, output: pointer, n: cint) {.importc, cdecl.}
+proc gpu_complex_mul_conj*(a, b, output: pointer, n: cint) {.importc, cdecl.}
+proc gpu_extract_column*(src, dst: pointer, col, n_cols, n_rows: cint) {.importc, cdecl.}
+proc gpu_scatter_to_state*(col, state: pointer, c, dim, n_rows: cint) {.importc, cdecl.}
+proc gpu_scale_array*(x: pointer, s: cfloat, n: cint) {.importc, cdecl.}
+proc gpu_fft_r2c_batched*(input, output: pointer, fft_len, batch: cint): cint {.importc, cdecl.}
+proc gpu_fft_c2r_batched*(input, output: pointer, fft_len, batch: cint): cint {.importc, cdecl.}
+proc gpu_complex_mul_broadcast*(a, b, output: pointer, stride, n: cint) {.importc, cdecl.}
+proc gpu_bank_scatter*(conv, state: pointer,
+    batchSize, seqLen, n_osc, dim, col_offset: cint, inv_fft: cfloat) {.importc, cdecl.}
+proc gpu_bank_gather*(drives, columns: pointer,
+    batchSize, seqLen, n_osc, fft_len: cint) {.importc, cdecl.}

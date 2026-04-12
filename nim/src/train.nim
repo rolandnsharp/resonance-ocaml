@@ -1,62 +1,73 @@
-## Resonance training — damped rotation on Shakespeare.
+## Resonance training — SineGate MLP stack on Shakespeare.
 ##
 ## Architecture:
-##   token → drive → [RMSNorm → W_mix → SineGate → residual] × L → RMSNorm → W_out → loss
+##   token → drive → pad to dim → [RMSNorm → W → SineGate → + residual] × L
+##   → RMSNorm → W_out → cross-entropy
 ##
-## Per-position online updates. Byte-level vocab (256).
-## First version: per-position MLP stack (no recurrence yet).
-## Next: add damped rotation recurrence using the CUDA kernel.
-##
-## Usage:
-##   cd nim && make train
+## All per-position (no recurrence in this version — fast on GPU).
+## Damped rotation recurrence will be added once this baseline converges.
 
 import std/[math, os, strformat, strutils, times, random]
 import gpu, model
 
 const
-  ## gpuSgemm op bits: 4=transA, 2=transB, 1=accumulate
   opNN  = 0  # C = A @ B
   opNT  = 2  # C = A @ B^T
-  opTN  = 4  # C = A^T @ B
-  opTNA = 5  # C += A^T @ B (accumulate)
+  opTNA = 5  # C += A^T @ B
 
 proc loadText(path: string): seq[int32] =
   let data = readFile(path)
   result = newSeq[int32](data.len)
-  for i, c in data:
-    result[i] = c.int32
+  for i, c in data: result[i] = c.int32
 
-proc train(m: var Model, data: seq[int32], steps: int, seqLen: int,
-           batchSize: int, lr: float32) =
+proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: float32) =
   let dim = m.dim
   let nOsc = m.nOsc
   let vocab = m.vocabSize
   let BT = batchSize * seqLen
   let dataLen = data.len
+  let nL = m.nLayers
 
-  # Pre-allocate all GPU buffers
-  let tokBuf = gpuCreate(BT)          # input tokens
-  let tgtBuf = gpuCreate(BT)          # targets
-  let driveBuf = gpuCreate(BT * nOsc) # drive embeddings
-  let stateBuf = gpuCreate(BT * dim)  # current state
-  let normBuf = gpuCreate(BT * dim)   # after RMSNorm
-  let mixBuf = gpuCreate(BT * dim)    # after W_mix
-  let actBuf = gpuCreate(BT * dim)    # after SineGate
+  # GPU buffers
+  let tokBuf = gpuCreate(BT)
+  let tgtBuf = gpuCreate(BT)
+  let driveBuf = gpuCreate(BT * nOsc)
+  # State + per-layer caches for backward
+  var states = newSeq[GpuBuf](nL + 1)     # state before each layer + final
+  var normed = newSeq[GpuBuf](nL + 1)     # normed at each layer + final
+  var mixed = newSeq[GpuBuf](nL)          # W output at each layer
+  for i in 0..nL:
+    states[i] = gpuCreate(BT * dim)
+    normed[i] = gpuCreate(BT * dim)
+  for i in 0..<nL:
+    mixed[i] = gpuCreate(BT * dim)
+
+  let actBuf = gpuCreate(BT * dim)
   let logitBuf = gpuCreate(BT * vocab)
   let lossBuf = gpuCreate(BT)
   let dLogitBuf = gpuCreate(BT * vocab)
   let dStateBuf = gpuCreate(BT * dim)
+  let dNormBuf = gpuCreate(BT * dim)
   let dMixBuf = gpuCreate(BT * dim)
 
-  # CPU-side arrays
   var tokData = newSeq[int32](BT)
   var tgtData = newSeq[int32](BT)
-  var lossData = newSeq[float32](BT)
+
+  # Pre-allocate FFT bank buffers (outside loop to avoid OOM)
+  let fftLen = 2 * seqLen
+  let fftCLen = fftLen div 2 + 1
+  let totalOsc = batchSize * nOsc
+  let columnsBuf = gpuCreate(totalOsc * fftLen)
+  let colsFft = gpuCreate(totalOsc * fftCLen * 2)
+  let prodPosFft = gpuCreate(totalOsc * fftCLen * 2)
+  let prodVelFft = gpuCreate(totalOsc * fftCLen * 2)
+  let convPosBuf = gpuCreate(totalOsc * fftLen)
+  let convVelBuf = gpuCreate(totalOsc * fftLen)
 
   let t0 = epochTime()
 
   for step in 0..<steps:
-    # Sample random sequences
+    # Sample
     for b in 0..<batchSize:
       let start = rand(dataLen - seqLen - 2)
       for i in 0..<seqLen:
@@ -65,36 +76,51 @@ proc train(m: var Model, data: seq[int32], steps: int, seqLen: int,
     tokBuf.gpuUploadInts(tokData)
     tgtBuf.gpuUploadInts(tgtData)
 
-    # LR schedule: linear warmup
-    let s = if step < 100: step.float32 / 100.0 else: 1.0
+    let s = if step < 200: step.float32 / 200.0 else: 1.0
     let curLr = lr * s
 
     # === Forward ===
 
-    # Embed: tokens → drives (BT × nOsc)
+    # Embed drives
     gpu_embed_fwd(tokBuf.data, m.drive.w.data, driveBuf.data, nOsc.cint, BT.cint)
 
-    # Initialize state: pad drives to dim (pos=drives, vel=0)
-    # For now: just zero-pad. TODO: proper FFT bank encoding
-    stateBuf.gpuZero()
-    gpuCopy(driveBuf, stateBuf, BT * nOsc)  # copy drives into first nOsc dims
+    # FFT bank: batched convolution — 3 kernel launches instead of 6144
+    states[0].gpuZero()
+    columnsBuf.gpuZero()
+    gpu_bank_gather(driveBuf.data, columnsBuf.data,
+      batchSize.cint, seqLen.cint, nOsc.cint, fftLen.cint)
 
-    # Per-position layers (no recurrence in this version)
-    for l in 0..<m.nLayers:
-      # RMSNorm
-      gpu_rmsnorm(stateBuf.data, normBuf.data, dim.cint, BT.cint)
-      # W_mix: (BT, dim) @ (dim, dim) → (BT, dim)
-      gpuSgemm(opNN, BT, dim, dim, normBuf, m.layers[l].wMix.w, mixBuf)
-      # SineGate
-      gpu_sinegate_fwd(mixBuf.data, actBuf.data, (BT * dim).cint)
-      # Residual: state += activated (using gpuCopy + we overwrite for now)
-      # TODO: proper add kernel. For now just use actBuf as next state.
-      gpuCopy(actBuf, stateBuf, BT * dim)
+    # 2. Batched FFT: all columns at once
+    discard gpu_fft_r2c_batched(columnsBuf.data, colsFft.data, fftLen.cint, totalOsc.cint)
 
-    # Output: RMSNorm → W_out → logits
-    gpu_rmsnorm(stateBuf.data, normBuf.data, dim.cint, BT.cint)
-    # logits(BT, vocab) = norm(BT, dim) @ W_out(dim, vocab)
-    gpuSgemm(opNN, BT, vocab, dim, normBuf, m.wOut.w, logitBuf)
+    # 3. Multiply by kernel FFTs (broadcast: each batch uses same kernel per oscillator)
+    gpu_complex_mul_broadcast(colsFft.data, m.hPosFft.data, prodPosFft.data,
+      (nOsc * fftCLen).cint, (totalOsc * fftCLen).cint)
+    gpu_complex_mul_broadcast(colsFft.data, m.hVelFft.data, prodVelFft.data,
+      (nOsc * fftCLen).cint, (totalOsc * fftCLen).cint)
+
+    # 4. Batched IFFT
+    discard gpu_fft_c2r_batched(prodPosFft.data, convPosBuf.data, fftLen.cint, totalOsc.cint)
+    discard gpu_fft_c2r_batched(prodVelFft.data, convVelBuf.data, fftLen.cint, totalOsc.cint)
+
+    # 5. Scatter to state
+    let invFft = 1.0 / fftLen.float32
+    gpu_bank_scatter(convPosBuf.data, states[0].data,
+      batchSize.cint, seqLen.cint, nOsc.cint, dim.cint, 0.cint, invFft.cfloat)
+    gpu_bank_scatter(convVelBuf.data, states[0].data,
+      batchSize.cint, seqLen.cint, nOsc.cint, dim.cint, nOsc.cint, invFft.cfloat)
+
+    # Layer stack: norm → W → SineGate → residual
+    for l in 0..<nL:
+      gpu_rmsnorm(states[l].data, normed[l].data, dim.cint, BT.cint)
+      gpuSgemm(opNN, BT, dim, dim, normed[l], m.layers[l].wMix.w, mixed[l])
+      gpu_sinegate_fwd(mixed[l].data, actBuf.data, (BT * dim).cint)
+      # residual: state[l+1] = state[l] + activated
+      gpu_add(states[l].data, actBuf.data, states[l+1].data, (BT * dim).cint)
+
+    # Output: norm → W_out → logits
+    gpu_rmsnorm(states[nL].data, normed[nL].data, dim.cint, BT.cint)
+    gpuSgemm(opNN, BT, vocab, dim, normed[nL], m.wOut.w, logitBuf)
 
     # Loss
     gpu_ce_loss(logitBuf.data, tgtBuf.data, lossBuf.data, vocab.cint, BT.cint)
@@ -105,32 +131,36 @@ proc train(m: var Model, data: seq[int32], steps: int, seqLen: int,
 
     # === Backward ===
 
-    # dLogits from CE loss
     gpu_ce_backward(logitBuf.data, tgtBuf.data, dLogitBuf.data, vocab.cint, BT.cint)
 
-    # dNorm = dLogits @ W_out^T : (BT, vocab) @ (vocab, dim) = (BT, dim)
-    gpuSgemm(opNT, BT, dim, vocab, dLogitBuf, m.wOut.w, dStateBuf)
+    # Through W_out
+    gpuSgemm(opNT, BT, dim, vocab, dLogitBuf, m.wOut.w, dNormBuf)  # dNorm
+    gpuSgemm(opTNA, dim, vocab, BT, normed[nL], dLogitBuf, m.wOut.g)  # dW_out
 
-    # dW_out += norm^T @ dLogits : (dim, BT) @ (BT, vocab) = (dim, vocab)
-    gpuSgemm(opTNA, dim, vocab, BT, normBuf, dLogitBuf, m.wOut.g)
+    # Through final RMSNorm
+    gpu_rmsnorm_bwd(states[nL].data, dNormBuf.data, dStateBuf.data, dim.cint, BT.cint)
 
-    # Backward through layers (reverse)
-    for l in countdown(m.nLayers - 1, 0):
-      # dSineGate: d(x*sin(x))/dx = sin(x) + x*cos(x)
-      gpu_sinegate_bwd(mixBuf.data, dStateBuf.data, dMixBuf.data, (BT * dim).cint)
+    # Through layers in reverse
+    for l in countdown(nL - 1, 0):
+      # dState splits: residual path + SineGate path
+      # Through SineGate
+      gpu_sinegate_bwd(mixed[l].data, dStateBuf.data, dMixBuf.data, (BT * dim).cint)
 
-      # dW_mix += norm^T @ dMix : (dim, BT) @ (BT, dim) = (dim, dim)
-      gpuSgemm(opTNA, dim, dim, BT, normBuf, dMixBuf, m.layers[l].wMix.g)
+      # Through W_mix
+      gpuSgemm(opTNA, dim, dim, BT, normed[l], dMixBuf, m.layers[l].wMix.g)  # dW
+      gpuSgemm(opNT, BT, dim, dim, dMixBuf, m.layers[l].wMix.w, dNormBuf)  # dNorm
 
-      # dNorm = dMix @ W_mix^T : (BT, dim) @ (dim, dim) = (BT, dim)
-      gpuSgemm(opNT, BT, dim, dim, dMixBuf, m.layers[l].wMix.w, dStateBuf)
+      # Through RMSNorm → dState for previous layer
+      # dState = dState_residual + dState_from_norm
+      # The residual path carries dState through unchanged
+      gpu_rmsnorm_bwd(states[l].data, dNormBuf.data, dNormBuf.data, dim.cint, BT.cint)
+      gpu_add_inplace(dStateBuf.data, dNormBuf.data, (BT * dim).cint)
+      # Note: dStateBuf now contains gradient for states[l]
 
-      # TODO: backward through RMSNorm (skip for now — approximate as identity)
-
-    # dDrive from embedding backward
+    # Through embedding
     gpu_embed_bwd(tokBuf.data, dStateBuf.data, m.drive.g.data, nOsc.cint, BT.cint)
 
-    # Adam step
+    # Adam
     let b1: float32 = 0.9
     let b2: float32 = 0.999
     let wd: float32 = 0.01
@@ -138,9 +168,9 @@ proc train(m: var Model, data: seq[int32], steps: int, seqLen: int,
     let bc1 = 1.0 / (1.0 - pow(b1, t))
     let bc2 = 1.0 / (1.0 - pow(b2, t))
 
-    m.drive.adamStep(curLr * 3.0, b1, b2, 0, bc1, bc2)  # higher LR for embeddings
+    m.drive.adamStep(curLr * 3.0, b1, b2, 0, bc1, bc2)
     m.wOut.adamStep(curLr, b1, b2, wd, bc1, bc2)
-    for l in 0..<m.nLayers:
+    for l in 0..<nL:
       m.layers[l].wMix.adamStep(curLr, b1, b2, wd, bc1, bc2)
 
     sync()
@@ -148,8 +178,8 @@ proc train(m: var Model, data: seq[int32], steps: int, seqLen: int,
     if step mod 100 == 0:
       let elapsed = epochTime() - t0
       let bpc = totalLoss / ln(2.0)
-      let stepsPerSec = if elapsed > 0: (step + 1).float / elapsed else: 0.0
-      echo &"step {step:5d}  loss {totalLoss:.3f}  bpc {bpc:.3f}  lr {curLr:.1e}  [{stepsPerSec:.1f} steps/s]"
+      let sps = if elapsed > 0: (step + 1).float / elapsed else: 0.0
+      echo &"step {step:5d}  loss {totalLoss:.3f}  bpc {bpc:.3f}  lr {curLr:.1e}  [{sps:.1f} s/s]"
 
   echo "\nDone."
 
@@ -160,7 +190,7 @@ proc main() =
   let dataPath = if paramCount() >= 1: paramStr(1) else: "data/shakespeare.txt"
   let nOsc = if paramCount() >= 2: parseInt(paramStr(2)) else: 96
   let nLayers = if paramCount() >= 3: parseInt(paramStr(3)) else: 6
-  let steps = if paramCount() >= 4: parseInt(paramStr(4)) else: 3000
+  let steps = if paramCount() >= 4: parseInt(paramStr(4)) else: 5000
 
   let data = loadText(dataPath)
   echo &"Data: {data.len} bytes from {dataPath}"

@@ -9,6 +9,7 @@
  */
 
 #include <cuda_runtime.h>
+#include <cufft.h>
 #include <math.h>
 
 #define BLOCK 256
@@ -152,6 +153,203 @@ __global__ void k_rotation_step_bwd(
     ddrive[drive_base + n_osc + k] = (1.0f - g) * bt * dv_out;
 }
 
+/* ---- FFT Bank: complex multiply in frequency domain ---- */
+
+__global__ void k_complex_mul(const cufftComplex* a, const cufftComplex* b,
+                               cufftComplex* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float ar = a[i].x, ai = a[i].y;
+    float br = b[i].x, bi = b[i].y;
+    out[i].x = ar * br - ai * bi;
+    out[i].y = ar * bi + ai * br;
+}
+
+__global__ void k_complex_mul_conj(const cufftComplex* a, const cufftComplex* b,
+                                    cufftComplex* out, int n) {
+    // Multiply a by conj(b) — for backward (FFT adjoint)
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float ar = a[i].x, ai = a[i].y;
+    float br = b[i].x, bi = -b[i].y;  // conjugate
+    out[i].x = ar * br - ai * bi;
+    out[i].y = ar * bi + ai * br;
+}
+
+__global__ void k_extract_column(const float* src, float* dst,
+                                  int col, int n_cols, int n_rows) {
+    // Extract column 'col' from row-major matrix (n_rows, n_cols)
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    dst[row] = src[row * n_cols + col];
+}
+
+__global__ void k_scatter_to_state(const float* col_data, float* state,
+                                    int col, int dim, int n_rows) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    state[row * dim + col] = col_data[row];
+}
+
+__global__ void k_scale_array(float* x, float s, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] *= s;
+}
+
+extern "C" void gpu_complex_mul(const void* a, const void* b, void* out, int n) {
+    k_complex_mul<<<(n+BLOCK-1)/BLOCK, BLOCK>>>((const cufftComplex*)a,
+        (const cufftComplex*)b, (cufftComplex*)out, n);
+}
+extern "C" void gpu_complex_mul_conj(const void* a, const void* b, void* out, int n) {
+    k_complex_mul_conj<<<(n+BLOCK-1)/BLOCK, BLOCK>>>((const cufftComplex*)a,
+        (const cufftComplex*)b, (cufftComplex*)out, n);
+}
+extern "C" void gpu_extract_column(const float* src, float* dst, int col, int n_cols, int n_rows) {
+    k_extract_column<<<(n_rows+BLOCK-1)/BLOCK, BLOCK>>>(src, dst, col, n_cols, n_rows);
+}
+extern "C" void gpu_scatter_to_state(const float* col, float* state, int c, int dim, int n_rows) {
+    k_scatter_to_state<<<(n_rows+BLOCK-1)/BLOCK, BLOCK>>>(col, state, c, dim, n_rows);
+}
+extern "C" void gpu_scale_array(float* x, float s, int n) {
+    k_scale_array<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(x, s, n);
+}
+
+// Batched cuFFT — one call for all oscillators × batch elements
+// Layout: data is (batch, fft_len) contiguous, batch = n_osc * batchSize
+extern "C" int gpu_fft_r2c_batched(float* input, void* output, int fft_len, int batch) {
+    cufftHandle plan;
+    cufftPlan1d(&plan, fft_len, CUFFT_R2C, batch);
+    int r = cufftExecR2C(plan, input, (cufftComplex*)output);
+    cufftDestroy(plan);
+    return r;
+}
+extern "C" int gpu_fft_c2r_batched(void* input, float* output, int fft_len, int batch) {
+    cufftHandle plan;
+    cufftPlan1d(&plan, fft_len, CUFFT_C2R, batch);
+    int r = cufftExecC2R(plan, (cufftComplex*)input, output);
+    cufftDestroy(plan);
+    return r;
+}
+
+// Batched complex multiply: out[i] = a[i] * b[i % stride] (broadcasts b over batches)
+__global__ void k_complex_mul_broadcast(const cufftComplex* a, const cufftComplex* b,
+                                         cufftComplex* out, int stride, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int j = i % stride;  // which oscillator's kernel
+    float ar = a[i].x, ai = a[i].y;
+    float br = b[j].x, bi = b[j].y;
+    out[i].x = ar * br - ai * bi;
+    out[i].y = ar * bi + ai * br;
+}
+
+extern "C" void gpu_complex_mul_broadcast(const void* a, const void* b, void* out,
+                                           int stride, int n) {
+    k_complex_mul_broadcast<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(
+        (const cufftComplex*)a, (const cufftComplex*)b, (cufftComplex*)out, stride, n);
+}
+
+// Transpose + scatter: from (batch*n_osc, seqLen) to (batch, seqLen, dim)
+// Each oscillator k's convolution result goes to column k (pos) or k+n_osc (vel)
+__global__ void k_bank_scatter(const float* conv_results, float* state,
+                                int batchSize, int seqLen, int n_osc, int dim,
+                                int col_offset, float inv_fft) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batchSize * n_osc * seqLen;
+    if (idx >= total) return;
+    int b = idx / (n_osc * seqLen);
+    int rem = idx % (n_osc * seqLen);
+    int k = rem / seqLen;
+    int t = rem % seqLen;
+    // conv_results layout: (batchSize * n_osc, fft_len), take first seqLen
+    int src_idx = (b * n_osc + k) * (seqLen * 2) + t;  // fft_len = 2*seqLen
+    int dst_idx = (b * seqLen + t) * dim + k + col_offset;
+    state[dst_idx] = conv_results[src_idx] * inv_fft;
+}
+
+extern "C" void gpu_bank_scatter(const float* conv, float* state,
+                                  int batchSize, int seqLen, int n_osc, int dim,
+                                  int col_offset, float inv_fft) {
+    int n = batchSize * n_osc * seqLen;
+    k_bank_scatter<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(conv, state,
+        batchSize, seqLen, n_osc, dim, col_offset, inv_fft);
+}
+
+// Gather drives into per-oscillator columns: (batch, seqLen, n_osc) → (batch*n_osc, fft_len)
+__global__ void k_bank_gather(const float* drives, float* columns,
+                               int batchSize, int seqLen, int n_osc, int fft_len) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batchSize * n_osc * seqLen;
+    if (idx >= total) return;
+    int b = idx / (n_osc * seqLen);
+    int rem = idx % (n_osc * seqLen);
+    int k = rem / seqLen;
+    int t = rem % seqLen;
+    int src_idx = (b * seqLen + t) * n_osc + k;
+    int dst_idx = (b * n_osc + k) * fft_len + t;
+    columns[dst_idx] = drives[src_idx];
+}
+
+extern "C" void gpu_bank_gather(const float* drives, float* columns,
+                                 int batchSize, int seqLen, int n_osc, int fft_len) {
+    int n = batchSize * n_osc * seqLen;
+    k_bank_gather<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(drives, columns,
+        batchSize, seqLen, n_osc, fft_len);
+}
+
+/* ---- Element-wise add: y = a + b ---- */
+
+__global__ void k_add(const float* a, const float* b, float* y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    y[i] = a[i] + b[i];
+}
+
+__global__ void k_add_inplace(float* a, const float* b, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    a[i] += b[i];
+}
+
+/* ---- RMSNorm backward ---- */
+
+__global__ void k_rmsnorm_bwd(const float* x, const float* dout, float* dx,
+                              int dim, int n) {
+    int row = blockIdx.x;
+    if (row >= n) return;
+    const float* xr = x + row * dim;
+    const float* dor = dout + row * dim;
+    float* dxr = dx + row * dim;
+
+    // Compute RMS
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        ss += xr[i] * xr[i];
+    for (int offset = warpSize/2; offset > 0; offset /= 2)
+        ss += __shfl_down_sync(0xffffffff, ss, offset);
+    __shared__ float shared_rms;
+    if (threadIdx.x == 0) shared_rms = sqrtf(ss / dim + 1e-8f);
+    __syncthreads();
+    float rms = shared_rms;
+    float inv = 1.0f / rms;
+
+    // Compute dot(dout, x_normed)
+    float dot = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        dot += dor[i] * xr[i];
+    for (int offset = warpSize/2; offset > 0; offset /= 2)
+        dot += __shfl_down_sync(0xffffffff, dot, offset);
+    __shared__ float shared_dot;
+    if (threadIdx.x == 0) shared_dot = dot;
+    __syncthreads();
+    dot = shared_dot;
+
+    // dx = inv * (dout - x * dot / (rms^2 * dim))
+    for (int i = threadIdx.x; i < dim; i += blockDim.x)
+        dxr[i] = inv * (dor[i] - xr[i] * dot / (rms * rms * dim));
+}
+
 /* ---- Sigmoid ---- */
 
 __global__ void k_sigmoid(const float* x, float* out, int n) {
@@ -246,6 +444,15 @@ void gpu_embed_bwd(const int* ids, const float* dout, float* dtable, int dim, in
 }
 void gpu_rmsnorm(const float* x, float* out, int dim, int n) {
     k_rmsnorm_fwd<<<n, BLOCK>>>(x, out, dim, n);
+}
+void gpu_rmsnorm_bwd(const float* x, const float* dout, float* dx, int dim, int n) {
+    k_rmsnorm_bwd<<<n, BLOCK>>>(x, dout, dx, dim, n);
+}
+void gpu_add(const float* a, const float* b, float* y, int n) {
+    k_add<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(a, b, y, n);
+}
+void gpu_add_inplace(float* a, const float* b, int n) {
+    k_add_inplace<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(a, b, n);
 }
 void gpu_sinegate_fwd(const float* x, float* out, int n) {
     k_sinegate_fwd<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(x, out, n);
