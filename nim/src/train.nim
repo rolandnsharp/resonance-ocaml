@@ -74,7 +74,15 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
   let convPosBuf = gpuCreate(totalOsc * fftLen)
   let convVelBuf = gpuCreate(totalOsc * fftLen)
 
-  let gradNormBuf = gpuCreate(1)  # scalar for gradient norm accumulation
+  # Bank backward buffers (pre-allocated)
+  let dBankPosBuf = gpuCreate(totalOsc * fftLen)
+  let dBankVelBuf = gpuCreate(totalOsc * fftLen)
+  let dPosFft = gpuCreate(totalOsc * fftCLen * 2)
+  let dVelFft = gpuCreate(totalOsc * fftCLen * 2)
+  let dDrivePosFft = gpuCreate(totalOsc * fftCLen * 2)
+  let dDriveVelFft = gpuCreate(totalOsc * fftCLen * 2)
+  let dDriveFft = gpuCreate(totalOsc * fftCLen * 2)
+  let dDriveConv = gpuCreate(totalOsc * fftLen)
 
   let t0 = epochTime()
 
@@ -88,14 +96,12 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
     tokBuf.gpuUploadInts(tokData)
     tgtBuf.gpuUploadInts(tgtData)
 
-    # Cosine schedule: warmup → peak → warmdown
-    let warmup = 200
-    let warmdownStart = steps - steps div 5
-    let s = if step < warmup: step.float32 / warmup.float32
-            elif step >= warmdownStart:
-              let progress = (step - warmdownStart).float32 / (steps - warmdownStart).float32
+    # OneCycleLR-style: 5% warmup, then cosine decay to near zero
+    let warmup = steps div 20  # 5%
+    let s = if step < warmup: step.float32 / max(1, warmup).float32
+            else:
+              let progress = (step - warmup).float32 / max(1, steps - warmup).float32
               0.5 * (1.0 + cos(PI * progress))
-            else: 1.0
     let curLr = lr * s
 
     # === Forward ===
@@ -213,8 +219,37 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
       gpu_rmsnorm_bwd(states[l].data, dNormBuf.data, dNormBuf.data, dim.cint, BT.cint)
       gpu_add_inplace(dStateBuf.data, dNormBuf.data, (BT * dim).cint)
 
-    # Through embedding
-    gpu_embed_bwd(tokBuf.data, dStateBuf.data, m.drive.g.data, nOsc.cint, BT.cint)
+    # Through FFT bank (adjoint): dState → dDrives via conj(H) convolution
+    dBankPosBuf.gpuZero()
+    dBankVelBuf.gpuZero()
+    # Gather pos gradients: dState[:, 0:n_osc] → (batch*n_osc, fft_len)
+    gpu_bank_gather(dStateBuf.data, dBankPosBuf.data,
+      batchSize.cint, seqLen.cint, nOsc.cint, fftLen.cint)
+    # For vel, we need to gather from offset n_osc — extract vel part of dState
+    # dState is (BT, dim) where dim=2*n_osc, vel is at columns [n_osc, 2*n_osc)
+    # bank_gather extracts columns [0, n_osc) — need to offset the source
+    gpu_bank_gather(
+      cast[pointer](cast[int](dStateBuf.data) + nOsc * 4),  # offset by n_osc floats
+      dBankVelBuf.data,
+      batchSize.cint, seqLen.cint, nOsc.cint, fftLen.cint)
+    # FFT, multiply by conj(H), IFFT
+    discard gpu_fft_r2c_batched(dBankPosBuf.data, dPosFft.data, fftLen.cint, totalOsc.cint)
+    discard gpu_fft_r2c_batched(dBankVelBuf.data, dVelFft.data, fftLen.cint, totalOsc.cint)
+    gpu_complex_mul_conj_broadcast(dPosFft.data, m.hPosFft.data, dDrivePosFft.data,
+      (nOsc * fftCLen).cint, (totalOsc * fftCLen).cint)
+    gpu_complex_mul_conj_broadcast(dVelFft.data, m.hVelFft.data, dDriveVelFft.data,
+      (nOsc * fftCLen).cint, (totalOsc * fftCLen).cint)
+    # Sum pos and vel contributions
+    gpu_add(dDrivePosFft.data, dDriveVelFft.data, dDriveFft.data, (totalOsc * fftCLen * 2).cint)
+    # IFFT back to time domain
+    discard gpu_fft_c2r_batched(dDriveFft.data, dDriveConv.data, fftLen.cint, totalOsc.cint)
+    # Scatter back to (BT, n_osc) format — reuse driveBuf as dDrives
+    driveBuf.gpuZero()
+    gpu_bank_scatter(dDriveConv.data, driveBuf.data,
+      batchSize.cint, seqLen.cint, nOsc.cint, nOsc.cint, 0.cint, invFft.cfloat)
+
+    # Through embedding using the properly back-propagated drive gradients
+    gpu_embed_bwd(tokBuf.data, driveBuf.data, m.drive.g.data, nOsc.cint, BT.cint)
 
     # Adam
     let b1: float32 = 0.9
@@ -255,6 +290,6 @@ proc main() =
   echo &"Data: {data.len} bytes from {dataPath}"
 
   var m = createModel(nOsc, nLayers, vocabSize = 256, seqLen = 128)
-  train(m, data, steps, seqLen = 128, batchSize = 32, lr = 3e-4)
+  train(m, data, steps, seqLen = 128, batchSize = 64, lr = 3e-4)
 
 main()

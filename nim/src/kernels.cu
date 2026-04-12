@@ -250,6 +250,24 @@ extern "C" void gpu_complex_mul_broadcast(const void* a, const void* b, void* ou
         (const cufftComplex*)a, (const cufftComplex*)b, (cufftComplex*)out, stride, n);
 }
 
+// Broadcast multiply with conjugate: out[i] = a[i] * conj(b[i % stride])
+__global__ void k_complex_mul_conj_broadcast(const cufftComplex* a, const cufftComplex* b,
+                                              cufftComplex* out, int stride, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int j = i % stride;
+    float ar = a[i].x, ai = a[i].y;
+    float br = b[j].x, bi = -b[j].y;  // conjugate
+    out[i].x = ar * br - ai * bi;
+    out[i].y = ar * bi + ai * br;
+}
+
+extern "C" void gpu_complex_mul_conj_broadcast(const void* a, const void* b, void* out,
+                                                int stride, int n) {
+    k_complex_mul_conj_broadcast<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(
+        (const cufftComplex*)a, (const cufftComplex*)b, (cufftComplex*)out, stride, n);
+}
+
 // Transpose + scatter: from (batch*n_osc, seqLen) to (batch, seqLen, dim)
 // Each oscillator k's convolution result goes to column k (pos) or k+n_osc (vel)
 __global__ void k_bank_scatter(const float* conv_results, float* state,

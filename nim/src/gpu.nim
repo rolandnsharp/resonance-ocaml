@@ -150,6 +150,7 @@ proc gpu_scale_array*(x: pointer, s: cfloat, n: cint) {.importc, cdecl.}
 proc gpu_fft_r2c_batched*(input, output: pointer, fft_len, batch: cint): cint {.importc, cdecl.}
 proc gpu_fft_c2r_batched*(input, output: pointer, fft_len, batch: cint): cint {.importc, cdecl.}
 proc gpu_complex_mul_broadcast*(a, b, output: pointer, stride, n: cint) {.importc, cdecl.}
+proc gpu_complex_mul_conj_broadcast*(a, b, output: pointer, stride, n: cint) {.importc, cdecl.}
 proc gpu_bank_scatter*(conv, state: pointer,
     batchSize, seqLen, n_osc, dim, col_offset: cint, inv_fft: cfloat) {.importc, cdecl.}
 proc gpu_bank_gather*(drives, columns: pointer,
