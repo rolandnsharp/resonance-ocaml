@@ -63,13 +63,15 @@ proc project*(input, weights, output: Buf, rows, outDim, inDim: int) =
   ## Linear projection: output = input @ weights
   gpuSgemm(0, rows, outDim, inDim, input, weights, output)
 
-proc addBias*(signal, bias: Buf, cols, n: int) =
+proc addBias*(signal: Buf, bias: Buf, cols, n: int): Buf {.discardable.} =
   ## Add per-column bias
   gpu_add_bias(signal.data, bias.data, cols.cint, n.cint)
+  result = signal
 
-proc activate*(signal: Buf, n: int) =
+proc activate*(signal: Buf, n: int): Buf {.discardable.} =
   ## Sigmoid: squash to (0, 1) — the gate opens/closes
   gpu_sigmoid(signal.data, signal.data, n.cint)
+  result = signal
 
 # ── Resonance: damped rotation ──
 

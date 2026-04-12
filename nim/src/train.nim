@@ -8,7 +8,7 @@
 ## Damped rotation recurrence will be added once this baseline converges.
 
 import std/[math, os, strformat, strutils, times, random, algorithm]
-import gpu, model, dsp
+import gpu, model
 
 const
   opNN  = 0  # C = A @ B
@@ -152,35 +152,67 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
               0.5 * (1.0 + cos(PI * progress))
     let curLr = lr * s
 
-    # === Forward: strike → propagate → [gate → resonate → interfere → harmonics] × L → listen ===
+    # === Forward ===
 
-    tokBuf |> strike(m.drive.w, driveBuf, nOsc, BT)
+    # Embed drives
+    gpu_embed_fwd(tokBuf.data, m.drive.w.data, driveBuf.data, nOsc.cint, BT.cint)
 
-    driveBuf |> propagate(columnsBuf, colsFft, prodPosFft, prodVelFft,
-                          convPosBuf, convVelBuf, m.hPosFft, m.hVelFft, states[0],
-                          batchSize, seqLen, nOsc, dim, fftLen, fftCLen, totalOsc)
+    # FFT bank: batched convolution — 3 kernel launches instead of 6144
+    states[0].gpuZero()
+    columnsBuf.gpuZero()
+    gpu_bank_gather(driveBuf.data, columnsBuf.data,
+      batchSize.cint, seqLen.cint, nOsc.cint, fftLen.cint)
 
+    # 2. Batched FFT: all columns at once
+    discard gpu_fft_r2c_batched(columnsBuf.data, colsFft.data, fftLen.cint, totalOsc.cint)
+
+    # 3. Multiply by kernel FFTs (broadcast: each batch uses same kernel per oscillator)
+    gpu_complex_mul_broadcast(colsFft.data, m.hPosFft.data, prodPosFft.data,
+      (nOsc * fftCLen).cint, (totalOsc * fftCLen).cint)
+    gpu_complex_mul_broadcast(colsFft.data, m.hVelFft.data, prodVelFft.data,
+      (nOsc * fftCLen).cint, (totalOsc * fftCLen).cint)
+
+    # 4. Batched IFFT
+    discard gpu_fft_c2r_batched(prodPosFft.data, convPosBuf.data, fftLen.cint, totalOsc.cint)
+    discard gpu_fft_c2r_batched(prodVelFft.data, convVelBuf.data, fftLen.cint, totalOsc.cint)
+
+    # 5. Scatter to state
+    let invFft = 1.0 / fftLen.float32
+    gpu_bank_scatter(convPosBuf.data, states[0].data,
+      batchSize.cint, seqLen.cint, nOsc.cint, dim.cint, 0.cint, invFft.cfloat)
+    gpu_bank_scatter(convVelBuf.data, states[0].data,
+      batchSize.cint, seqLen.cint, nOsc.cint, dim.cint, nOsc.cint, invFft.cfloat)
+
+    # Layer stack: norm → project controls → damped rotation → W → SineGate → residual
     for l in 0..<nL:
-      let ly = m.layers[l]
+      gpu_rmsnorm(states[l].data, normed[l].data, dim.cint, BT.cint)
 
-      states[l] |> normalize(normed[l], dim, BT)
+      # Project controls with bias: gamma, beta, sense (dim → n_osc each)
+      gpuSgemm(opNN, BT, nOsc, dim, normed[l], m.layers[l].projGamma.w, gammaBuf)
+      gpu_add_bias(gammaBuf.data, m.layers[l].projGammaBias.w.data, nOsc.cint, (BT * nOsc).cint)
+      gpu_sigmoid(gammaBuf.data, gammaBuf.data, (BT * nOsc).cint)
+      gpuSgemm(opNN, BT, nOsc, dim, normed[l], m.layers[l].projBeta.w, betaBuf)
+      gpu_add_bias(betaBuf.data, m.layers[l].projBetaBias.w.data, nOsc.cint, (BT * nOsc).cint)
+      gpu_sigmoid(betaBuf.data, betaBuf.data, (BT * nOsc).cint)
+      gpuSgemm(opNN, BT, nOsc, dim, normed[l], m.layers[l].projSense.w, senseBuf)
+      gpu_add_bias(senseBuf.data, m.layers[l].projSenseBias.w.data, nOsc.cint, (BT * nOsc).cint)
+      gpu_sigmoid(senseBuf.data, senseBuf.data, (BT * nOsc).cint)
 
-      normed[l] |> project(ly.projGamma.w, gammaBuf, BT, nOsc, dim)
-      gammaBuf  |> addBias(ly.projGammaBias.w, nOsc, BT * nOsc) |> activate(BT * nOsc)
-      normed[l] |> project(ly.projBeta.w, betaBuf, BT, nOsc, dim)
-      betaBuf   |> addBias(ly.projBetaBias.w, nOsc, BT * nOsc) |> activate(BT * nOsc)
-      normed[l] |> project(ly.projSense.w, senseBuf, BT, nOsc, dim)
-      senseBuf  |> addBias(ly.projSenseBias.w, nOsc, BT * nOsc) |> activate(BT * nOsc)
+      # Damped rotation scan
+      gpu_rotation_scan(gammaBuf.data, betaBuf.data, senseBuf.data,
+        states[0].data, oscOutBuf.data,
+        m.cosW.data, m.sinW.data, m.freqs.data,
+        batchSize.cint, seqLen.cint, nOsc.cint)
 
-      gammaBuf |> resonate(betaBuf, senseBuf, states[0], oscOutBuf,
-                           m.cosW, m.sinW, m.freqs, batchSize, seqLen, nOsc)
+      # Interference: dense W computes all pairwise cross-terms between oscillators
+      # spectralRe is repurposed as wMix (dim × dim)
+      gpuSgemm(opNN, BT, dim, dim, oscOutBuf, m.layers[l].spectralRe.w, mixed[l])
+      gpu_sinegate_fwd(mixed[l].data, actBuf.data, (BT * dim).cint)
+      gpu_add(states[l].data, actBuf.data, states[l+1].data, (BT * dim).cint)
 
-      oscOutBuf |> interfere(ly.spectralRe.w, mixed[l], BT, dim)
-      mixed[l]  |> harmonics(actBuf, BT * dim)
-      states[l] |> superpose(actBuf, states[l+1], BT * dim)
-
-    states[nL] |> normalize(normed[nL], dim, BT)
-    normed[nL] |> interfere(m.wOut.w, logitBuf, BT, vocab)
+    # Output: norm → W_out → logits
+    gpu_rmsnorm(states[nL].data, normed[nL].data, dim.cint, BT.cint)
+    gpuSgemm(opNN, BT, vocab, dim, normed[nL], m.wOut.w, logitBuf)
 
     # Loss
     gpu_ce_loss(logitBuf.data, tgtBuf.data, lossBuf.data, vocab.cint, BT.cint)
