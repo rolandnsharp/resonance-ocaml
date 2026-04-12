@@ -203,8 +203,10 @@ class Resonance(nn.Module):
 
 def train(model, text, steps=10000, batch_size=32, seq_len=128, lr=3e-4, device='cuda'):
     model = model.to(device)
+    torch.set_float32_matmul_precision('high')
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=lr, total_steps=steps, pct_start=0.05)
 
     data = torch.tensor([ord(c) for c in text], dtype=torch.long, device=device)
     n = len(data)

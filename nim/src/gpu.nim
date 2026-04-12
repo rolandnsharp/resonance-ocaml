@@ -1,87 +1,127 @@
-## GPU memory management and CUDA bindings for Resonance.
-## Borrowed patterns from nimllm, stripped to what we need.
+## gpu.nim — CUDA bindings for Resonance.
+## Based on nimllm/gpu.nim patterns.
 
-{.passL: "src/kernels.o -lcudart -lcublas -lcufft -lstdc++".}
+{.passL: "src/kernels.o -lcudart -lcublas -lstdc++".}
 
-# --- CUDA runtime ---
-proc cudaMalloc(p: ptr pointer, size: csize_t): cint {.importc, header: "<cuda_runtime.h>".}
-proc cudaFree(p: pointer): cint {.importc, header: "<cuda_runtime.h>".}
-proc cudaMemcpy*(dst, src: pointer, size: csize_t, kind: cint): cint {.importc, header: "<cuda_runtime.h>".}
-proc cudaMemset*(p: pointer, value: cint, size: csize_t): cint {.importc, header: "<cuda_runtime.h>".}
-proc cudaDeviceSynchronize*(): cint {.importc, header: "<cuda_runtime.h>".}
+# ── CUDA types ────────────────────────────────────────────────────
 
-const cudaMemcpyDeviceToDevice* = 3.cint
-
-const
-  cudaMemcpyHostToDevice = 1.cint
-  cudaMemcpyDeviceToHost = 2.cint
-
-# --- cuBLAS ---
-type CublasHandle = pointer
-proc cublasCreate_v2(h: ptr CublasHandle): cint {.importc, header: "<cublas_v2.h>".}
-proc cublasSgemm_v2(h: CublasHandle, ta, tb: cint,
-    m, n, k: cint, alpha: ptr cfloat, A: pointer, lda: cint,
-    B: pointer, ldb: cint, beta: ptr cfloat, C: pointer, ldc: cint): cint {.importc, header: "<cublas_v2.h>".}
+type
+  CudaError* {.importc: "cudaError_t", header: "<cuda_runtime.h>".} = cint
+  CublasHandle* {.importc: "cublasHandle_t", header: "<cublas_v2.h>".} = pointer
+  CublasStatus* {.importc: "cublasStatus_t", header: "<cublas_v2.h>".} = cint
+  CublasOperation* {.importc: "cublasOperation_t", header: "<cublas_v2.h>".} = cint
 
 const
-  CUBLAS_OP_N = 0.cint
-  CUBLAS_OP_T = 1.cint
+  CudaSuccess* = 0.CudaError
+  CublasOpN* = 0.CublasOperation
+  CublasOpT* = 1.CublasOperation
 
-var cublasH*: CublasHandle
+# ── CUDA runtime ──────────────────────────────────────────────────
 
-proc initCublas*() =
-  discard cublasCreate_v2(addr cublasH)
+proc cudaMalloc*(devPtr: ptr pointer, size: csize_t): CudaError
+  {.importc, header: "<cuda_runtime.h>".}
+proc cudaFree*(devPtr: pointer): CudaError
+  {.importc, header: "<cuda_runtime.h>".}
+proc cudaMemcpy*(dst, src: pointer, count: csize_t, kind: cint): CudaError
+  {.importc, header: "<cuda_runtime.h>".}
+proc cudaMemset*(devPtr: pointer, value: cint, count: csize_t): CudaError
+  {.importc, header: "<cuda_runtime.h>".}
+proc cudaDeviceSynchronize*(): CudaError
+  {.importc, header: "<cuda_runtime.h>".}
 
-# --- GPU buffer ---
-type GpuBuf* = object
-  data*: pointer
-  len*: int  # number of float32s
+const
+  CudaMemcpyHostToDevice* = 1.cint
+  CudaMemcpyDeviceToHost* = 2.cint
+  CudaMemcpyDeviceToDevice* = 3.cint
 
-proc gpuAlloc*(n: int): GpuBuf =
-  result.len = n
-  discard cudaMalloc(addr result.data, csize_t(n * 4))
-  discard cudaMemset(result.data, 0, csize_t(n * 4))
+# ── cuBLAS ────────────────────────────────────────────────────────
 
-proc gpuFree*(b: GpuBuf) =
-  discard cudaFree(b.data)
+proc cublasCreate*(handle: ptr CublasHandle): CublasStatus
+  {.importc: "cublasCreate_v2", header: "<cublas_v2.h>".}
+proc cublasSgemm*(handle: CublasHandle, transa, transb: CublasOperation,
+    m, n, k: cint, alpha: ptr cfloat, a: pointer, lda: cint,
+    b: pointer, ldb: cint, beta: ptr cfloat, c: pointer, ldc: cint): CublasStatus
+  {.importc: "cublasSgemm_v2", header: "<cublas_v2.h>".}
 
-proc upload*(b: GpuBuf, data: openArray[float32]) =
-  assert data.len <= b.len
-  discard cudaMemcpy(b.data, unsafeAddr data[0], csize_t(data.len * 4), cudaMemcpyHostToDevice)
+# ── GPU Buffer ────────────────────────────────────────────────────
 
-proc download*(b: GpuBuf, data: var openArray[float32]) =
-  assert data.len <= b.len
-  discard cudaMemcpy(addr data[0], b.data, csize_t(data.len * 4), cudaMemcpyDeviceToHost)
+type
+  GpuBuf* = object
+    data*: pointer
+    numel*: int
 
-proc uploadInts*(b: GpuBuf, data: openArray[int32]) =
-  assert data.len <= b.len
-  discard cudaMemcpy(b.data, unsafeAddr data[0], csize_t(data.len * 4), cudaMemcpyHostToDevice)
+proc gpuCreate*(n: int): GpuBuf =
+  result.numel = n
+  let err = cudaMalloc(addr result.data, csize_t(n * sizeof(cfloat)))
+  assert err == CudaSuccess, "cudaMalloc failed"
+  discard cudaMemset(result.data, 0, csize_t(n * sizeof(cfloat)))
+
+proc gpuFree*(buf: var GpuBuf) =
+  if buf.data != nil:
+    discard cudaFree(buf.data)
+    buf.data = nil; buf.numel = 0
+
+proc gpuUpload*(buf: GpuBuf, hostData: openArray[float32]) =
+  assert hostData.len == buf.numel
+  discard cudaMemcpy(buf.data, unsafeAddr hostData[0],
+                     csize_t(buf.numel * sizeof(cfloat)), CudaMemcpyHostToDevice)
+
+proc gpuDownload*(buf: GpuBuf): seq[float32] =
+  result = newSeq[float32](buf.numel)
+  discard cudaMemcpy(addr result[0], buf.data,
+                     csize_t(buf.numel * sizeof(cfloat)), CudaMemcpyDeviceToHost)
+
+proc gpuCopy*(src, dst: GpuBuf, n: int) =
+  discard cudaMemcpy(dst.data, src.data,
+                     csize_t(n * sizeof(cfloat)), CudaMemcpyDeviceToDevice)
+
+proc gpuZero*(buf: GpuBuf) =
+  discard cudaMemset(buf.data, 0, csize_t(buf.numel * sizeof(cfloat)))
+
+proc toGpu*(data: openArray[float32]): GpuBuf =
+  result = gpuCreate(data.len)
+  gpuUpload(result, data)
+
+proc gpuUploadInts*(buf: GpuBuf, data: openArray[int32]) =
+  assert data.len <= buf.numel
+  discard cudaMemcpy(buf.data, unsafeAddr data[0],
+                     csize_t(data.len * sizeof(cint)), CudaMemcpyHostToDevice)
+
+# ── Global cuBLAS handle ─────────────────────────────────────────
+
+var gCublas: CublasHandle
+
+proc gpuInit*() =
+  let err = cublasCreate(addr gCublas)
+  assert err == 0, "cublasCreate failed"
+
+# ── GEMM wrapper (from nimllm) ───────────────────────────────────
+## 3-bit op encoding:
+##   bit 2 (4): transpose A
+##   bit 1 (2): transpose B
+##   bit 0 (1): accumulate (beta=1) vs overwrite (beta=0)
+
+proc gpuSgemm*(op: int, m, n, k: int, a, b, c: GpuBuf) =
+  var alpha: cfloat = 1.0
+  var beta: cfloat = if (op and 1) != 0: 1.0 else: 0.0
+  let ta = (op and 4) != 0
+  let tb = (op and 2) != 0
+  let opB = if tb: CublasOpT else: CublasOpN
+  let opA = if ta: CublasOpT else: CublasOpN
+  let lda = if ta: cint(m) else: cint(k)
+  let ldb = if tb: cint(k) else: cint(n)
+  let ldc = cint(n)
+  discard cublasSgemm(gCublas, opB, opA, cint(n), cint(m), cint(k),
+                      addr alpha, b.data, ldb, a.data, lda,
+                      addr beta, c.data, ldc)
 
 proc sync*() =
   discard cudaDeviceSynchronize()
 
-# --- cuBLAS wrappers ---
+# ── Kernel bindings ───────────────────────────────────────────────
 
-proc gpuMatmul*(C, A, B: GpuBuf, m, n, k: int, beta: float32 = 0.0) =
-  ## C[m,n] = A[m,k] @ B[k,n]  (row-major, but cuBLAS is col-major so we transpose)
-  var alpha: cfloat = 1.0
-  var betaC: cfloat = beta
-  discard cublasSgemm_v2(cublasH, CUBLAS_OP_N, CUBLAS_OP_N,
-    n.cint, m.cint, k.cint, addr alpha,
-    B.data, n.cint, A.data, k.cint, addr betaC, C.data, n.cint)
-
-proc gpuMatmulT*(C, A, B: GpuBuf, m, n, k: int, beta: float32 = 0.0) =
-  ## C[m,n] = A[m,k] @ B^T[n,k]  (B transposed)
-  var alpha: cfloat = 1.0
-  var betaC: cfloat = beta
-  discard cublasSgemm_v2(cublasH, CUBLAS_OP_T, CUBLAS_OP_N,
-    n.cint, m.cint, k.cint, addr alpha,
-    B.data, k.cint, A.data, k.cint, addr betaC, C.data, n.cint)
-
-# --- Kernel bindings ---
-
-proc gpu_embed_fwd*(ids: pointer, table, output: pointer, dim, n: cint) {.importc, cdecl.}
-proc gpu_embed_bwd*(ids: pointer, dout, dtable: pointer, dim, n: cint) {.importc, cdecl.}
+proc gpu_embed_fwd*(ids, table, output: pointer, dim, n: cint) {.importc, cdecl.}
+proc gpu_embed_bwd*(ids, dout, dtable: pointer, dim, n: cint) {.importc, cdecl.}
 proc gpu_rmsnorm*(x, output: pointer, dim, n: cint) {.importc, cdecl.}
 proc gpu_sinegate_fwd*(x, output: pointer, n: cint) {.importc, cdecl.}
 proc gpu_sinegate_bwd*(x, dout, dx: pointer, n: cint) {.importc, cdecl.}
@@ -93,11 +133,9 @@ proc gpu_rotation_step_bwd*(dpos_out, dvel_out, pos_prev, vel_prev: pointer,
     B, n_osc: cint) {.importc, cdecl.}
 proc gpu_sigmoid*(x, output: pointer, n: cint) {.importc, cdecl.}
 proc gpu_sigmoid_bwd*(sig_out, dout, dx: pointer, n: cint) {.importc, cdecl.}
-proc gpu_ce_loss*(logits: pointer, targets: pointer, losses: pointer,
-    vocab, n: cint) {.importc, cdecl.}
-proc gpu_ce_backward*(logits: pointer, targets: pointer, dlogits: pointer,
-    vocab, n: cint) {.importc, cdecl.}
+proc gpu_ce_loss*(logits, targets, losses: pointer, vocab, n: cint) {.importc, cdecl.}
+proc gpu_ce_backward*(logits, targets, dlogits: pointer, vocab, n: cint) {.importc, cdecl.}
 proc gpu_adamw*(param, grad, m, v: pointer,
     lr, b1, b2, wd, bc1, bc2: cfloat, n: cint) {.importc, cdecl.}
-proc gpu_grad_norm*(grad: pointer, output: pointer, n: cint) {.importc, cdecl.}
+proc gpu_grad_norm*(grad, output: pointer, n: cint) {.importc, cdecl.}
 proc gpu_scale*(x: pointer, s: cfloat, n: cint) {.importc, cdecl.}

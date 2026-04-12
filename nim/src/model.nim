@@ -45,10 +45,10 @@ type
 
 proc initParam(n: int, initStd: float32 = 0.0): Param =
   result.n = n
-  result.w = gpuAlloc(n)
-  result.g = gpuAlloc(n)
-  result.m = gpuAlloc(n)
-  result.v = gpuAlloc(n)
+  result.w = gpuCreate(n)
+  result.g = gpuCreate(n)
+  result.m = gpuCreate(n)
+  result.v = gpuCreate(n)
   if initStd > 0:
     var data = newSeq[float32](n)
     for i in 0..<n:
@@ -56,7 +56,7 @@ proc initParam(n: int, initStd: float32 = 0.0): Param =
       let u1 = rand(1.0).float32 + 1e-7
       let u2 = rand(1.0).float32
       data[i] = sqrt(-2.0 * ln(u1)).float32 * cos(2.0 * PI * u2).float32 * initStd
-    result.w.upload(data)
+    result.w.gpuUpload(data)
 
 proc adamStep*(p: var Param, lr, b1, b2, wd, bc1, bc2: float32) =
   if p.n > 0:
@@ -92,7 +92,7 @@ proc createModel*(nOsc, nLayers, vocabSize, seqLen: int): Model =
     # Init mixScale to ones
     var ones = newSeq[float32](dim)
     for i in 0..<dim: ones[i] = 1.0
-    result.layers[l].mixScale.w.upload(ones)
+    result.layers[l].mixScale.w.gpuUpload(ones)
 
   # Precompute oscillator constants
   var cosData = newSeq[float32](nOsc)
@@ -104,12 +104,12 @@ proc createModel*(nOsc, nLayers, vocabSize, seqLen: int): Model =
     cosData[k] = cos(f)
     sinData[k] = sin(f)
 
-  result.cosW = gpuAlloc(nOsc)
-  result.sinW = gpuAlloc(nOsc)
-  result.freqs = gpuAlloc(nOsc)
-  result.cosW.upload(cosData)
-  result.sinW.upload(sinData)
-  result.freqs.upload(freqData)
+  result.cosW = gpuCreate(nOsc)
+  result.sinW = gpuCreate(nOsc)
+  result.freqs = gpuCreate(nOsc)
+  result.cosW.gpuUpload(cosData)
+  result.sinW.gpuUpload(sinData)
+  result.freqs.gpuUpload(freqData)
 
   echo &"Resonance: {nOsc} osc, {nLayers} layers, dim={dim}, vocab={vocabSize}"
   let nParams = vocabSize * nOsc + dim * vocabSize +
