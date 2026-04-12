@@ -97,8 +97,8 @@ proc createModel*(nOsc, nLayers, vocabSize, seqLen: int): Model =
     result.layers[l].projGamma = initParam(dim * nOsc, projScale)
     result.layers[l].projBeta = initParam(dim * nOsc, projScale)
     result.layers[l].projSense = initParam(dim * nOsc, projScale)
-    # Interference: dense W — full Xavier (logit clamp prevents NaN)
-    let wMixScale = 1.0 / sqrt(dim.float32)
+    # Constant energy cascade: gain scales with depth for stable cascading
+    let wMixScale = 1.0 / sqrt(dim.float32 * nLayers.float32)
     result.layers[l].spectralRe = initParam(dim * dim, wMixScale)
     result.layers[l].spectralIm = initParam(0)  # unused
     result.layers[l].gateProj = initParam(0)   # unused
