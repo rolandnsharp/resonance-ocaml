@@ -337,6 +337,79 @@ extern "C" void gpu_strided_gather(const float* src, float* dst,
     k_strided_gather<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(src, dst, rows, stride, n_osc, col_offset, 0);
 }
 
+/* ---- Spectral mixing: batched FFT across dim, pointwise complex multiply, IFFT ---- */
+
+// Complex pointwise multiply with learned weights + content gate
+// spec_out[i] = spec_in[i] * (wRe[i] + j*wIm[i]) * gate[i]
+__global__ void k_spectral_mul_gated(
+    const cufftComplex* spec_in, cufftComplex* spec_out,
+    const float* wRe, const float* wIm, const float* gate,
+    int specLen, int batch) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * specLen) return;
+    int row = idx / specLen;
+    int k = idx % specLen;
+    float ir = spec_in[idx].x, ii = spec_in[idx].y;
+    float wr = wRe[k], wi = wIm[k];
+    float g = gate[row * specLen + k];
+    // Complex multiply then gate
+    float or_ = (ir * wr - ii * wi) * g;
+    float oi = (ir * wi + ii * wr) * g;
+    spec_out[idx].x = or_;
+    spec_out[idx].y = oi;
+}
+
+// Backward: gradient through spectral multiply
+// d_spec_in, d_wRe, d_wIm, d_gate from d_spec_out
+__global__ void k_spectral_mul_gated_bwd(
+    const cufftComplex* spec_in, const cufftComplex* d_spec_out,
+    const float* wRe, const float* wIm, const float* gate,
+    cufftComplex* d_spec_in, float* d_wRe, float* d_wIm, float* d_gate,
+    int specLen, int batch) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch * specLen) return;
+    int row = idx / specLen;
+    int k = idx % specLen;
+    float ir = spec_in[idx].x, ii = spec_in[idx].y;
+    float wr = wRe[k], wi = wIm[k];
+    float g = gate[row * specLen + k];
+    float dor = d_spec_out[idx].x, doi = d_spec_out[idx].y;
+
+    // Through gate: d(x*g)/dg = x, d(x*g)/dx = g
+    float pre_gate_r = ir * wr - ii * wi;
+    float pre_gate_i = ir * wi + ii * wr;
+    atomicAdd(&d_gate[row * specLen + k], dor * pre_gate_r + doi * pre_gate_i);
+    float dgr = dor * g, dgi = doi * g;
+
+    // Through complex multiply: d_spec_in and d_w
+    d_spec_in[idx].x = dgr * wr + dgi * wi;
+    d_spec_in[idx].y = -dgr * wi + dgi * wr;
+    atomicAdd(&d_wRe[k], dgr * ir + dgi * ii);
+    atomicAdd(&d_wIm[k], -dgr * ii + dgi * ir);
+}
+
+extern "C" void gpu_spectral_mul_gated(
+    const void* spec_in, void* spec_out,
+    const float* wRe, const float* wIm, const float* gate,
+    int specLen, int batch) {
+    int n = batch * specLen;
+    k_spectral_mul_gated<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(
+        (const cufftComplex*)spec_in, (cufftComplex*)spec_out,
+        wRe, wIm, gate, specLen, batch);
+}
+
+extern "C" void gpu_spectral_mul_gated_bwd(
+    const void* spec_in, const void* d_spec_out,
+    const float* wRe, const float* wIm, const float* gate,
+    void* d_spec_in, float* d_wRe, float* d_wIm, float* d_gate,
+    int specLen, int batch) {
+    int n = batch * specLen;
+    k_spectral_mul_gated_bwd<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(
+        (const cufftComplex*)spec_in, (const cufftComplex*)d_spec_out,
+        wRe, wIm, gate, (cufftComplex*)d_spec_in, d_wRe, d_wIm, d_gate,
+        specLen, batch);
+}
+
 /* ---- Monarch permutation: reshape(nBlocks, blockSize) → transpose → reshape(dim) ---- */
 
 __global__ void k_monarch_permute(const float* in, float* out,

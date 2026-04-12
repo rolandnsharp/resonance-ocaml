@@ -211,6 +211,13 @@ proc gpu_bank_gather*(drives, columns: pointer,
     batchSize, seqLen, n_osc, fft_len: cint) {.importc, cdecl.}
 proc gpu_strided_gather*(src, dst: pointer,
     rows, stride, n_osc, col_offset: cint) {.importc, cdecl.}
+proc gpu_spectral_mul_gated*(spec_in, spec_out: pointer,
+    wRe, wIm, gate: pointer, specLen, batch: cint) {.importc, cdecl.}
+proc gpu_spectral_mul_gated_bwd*(spec_in, d_spec_out: pointer,
+    wRe, wIm, gate: pointer,
+    d_spec_in, d_wRe, d_wIm, d_gate: pointer,
+    specLen, batch: cint) {.importc, cdecl.}
+
 proc gpu_monarch_permute*(input, output: pointer,
     nBlocks, blockSize, rows: cint) {.importc, cdecl.}
 proc gpu_monarch_permute_inv*(input, output: pointer,

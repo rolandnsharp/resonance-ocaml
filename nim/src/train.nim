@@ -86,6 +86,12 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
   let dPosTmp = gpuCreate(BT * nOsc)
   let dVelTmp = gpuCreate(BT * nOsc)
 
+  # Spectral mixing buffers
+  let specLen = dim div 2 + 1
+  let gateBuf = gpuCreate(BT * specLen)
+  let specFftBuf = gpuCreate(BT * specLen * 2)  # complex
+  let specProdBuf = gpuCreate(BT * specLen * 2)  # complex
+
   let t0 = epochTime()
 
   for step in 0..<steps:
@@ -155,13 +161,20 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
         m.cosW.data, m.sinW.data, m.freqs.data,
         batchSize.cint, seqLen.cint, nOsc.cint)
 
-      # Monarch W_mix: L factor → permute → R factor
-      let ly = m.layers[l]
-      let nb = ly.nBlocks
-      let bs = ly.blockSize
-      gpuMonarchMul(ly.monarchL.w, oscOutBuf, mixed[l], nb, bs, BT)
-      gpu_monarch_permute(mixed[l].data, oscOutBuf.data, nb.cint, bs.cint, BT.cint)
-      gpuMonarchMul(ly.monarchR.w, oscOutBuf, mixed[l], nb, bs, BT)
+      # Spectral mixing: FFT across oscillator dim → learned weights × gate → IFFT
+      let specLen = dim div 2 + 1
+      # Content gate: project mean state to specLen, sigmoid
+      gpuSgemm(opNN, BT, specLen, dim, normed[l], m.layers[l].gateProj.w, gateBuf)
+      gpu_sigmoid(gateBuf.data, gateBuf.data, (BT * specLen).cint)
+      # FFT each row across dim
+      discard gpu_fft_r2c_batched(oscOutBuf.data, specFftBuf.data, dim.cint, BT.cint)
+      # Multiply by learned weights with gate
+      gpu_spectral_mul_gated(specFftBuf.data, specProdBuf.data,
+        m.layers[l].spectralRe.w.data, m.layers[l].spectralIm.w.data,
+        gateBuf.data, specLen.cint, BT.cint)
+      # IFFT back
+      discard gpu_fft_c2r_batched(specProdBuf.data, mixed[l].data, dim.cint, BT.cint)
+      gpu_scale_array(mixed[l].data, 1.0 / dim.float32, (BT * dim).cint)
       gpu_sinegate_fwd(mixed[l].data, actBuf.data, (BT * dim).cint)
       gpu_add(states[l].data, actBuf.data, states[l+1].data, (BT * dim).cint)
 
@@ -192,32 +205,21 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
       # Through SineGate: dMix = dState * sinegate'(mixed)
       gpu_sinegate_bwd(mixed[l].data, dStateBuf.data, dMixBuf.data, (BT * dim).cint)
 
-      # Through Monarch: backward R → inv permute → backward L
-      let lyb = m.layers[l]
-      let nbb = lyb.nBlocks
-      let bsb = lyb.blockSize
-
-      # Recompute forward intermediates for gradient
-      # intermediate = L × oscOut
-      gpuMonarchMul(lyb.monarchL.w, oscOutBuf, actBuf, nbb, bsb, BT)
-      # permuted = P × intermediate
-      gpu_monarch_permute(actBuf.data, dOscOutBuf.data, nbb.cint, bsb.cint, BT.cint)
-      # dOscOutBuf now holds "permuted" (the input to R)
-
-      # dR += permuted^T @ dMixed (per-block outer product)
-      gpuMonarchGrad(dMixBuf, dOscOutBuf, lyb.monarchR.g, nbb, bsb, BT)
-
-      # dPermuted = dMixed @ R^T (gradient through R)
-      gpuMonarchMul(lyb.monarchR.w, dMixBuf, dOscOutBuf, nbb, bsb, BT)
-
-      # dIntermediate = P^{-1} × dPermuted (inverse permute)
-      gpu_monarch_permute_inv(dOscOutBuf.data, dMixBuf.data, nbb.cint, bsb.cint, BT.cint)
-
-      # dL += oscOut^T @ dIntermediate (per-block outer product)
-      gpuMonarchGrad(dMixBuf, oscOutBuf, lyb.monarchL.g, nbb, bsb, BT)
-
-      # dOscOut = dIntermediate @ L^T (gradient through L)
-      gpuMonarchMul(lyb.monarchL.w, dMixBuf, dOscOutBuf, nbb, bsb, BT)
+      # Through spectral mixing backward
+      gpu_scale_array(dMixBuf.data, 1.0 / dim.float32, (BT * dim).cint)
+      # FFT dMix and recompute forward FFT of oscOut
+      discard gpu_fft_r2c_batched(dMixBuf.data, specProdBuf.data, dim.cint, BT.cint)
+      discard gpu_fft_r2c_batched(oscOutBuf.data, specFftBuf.data, dim.cint, BT.cint)
+      # Backward through spectral multiply
+      let dSpecIn = specFftBuf  # reuse (overwrite forward FFT, we're done with it)
+      gpu_spectral_mul_gated_bwd(
+        specFftBuf.data, specProdBuf.data,
+        m.layers[l].spectralRe.w.data, m.layers[l].spectralIm.w.data, gateBuf.data,
+        dSpecIn.data, m.layers[l].spectralRe.g.data, m.layers[l].spectralIm.g.data,
+        gateBuf.data, specLen.cint, BT.cint)
+      # IFFT d_spec_in back to dOscOut
+      discard gpu_fft_c2r_batched(dSpecIn.data, dOscOutBuf.data, dim.cint, BT.cint)
+      gpu_scale_array(dOscOutBuf.data, 1.0 / dim.float32, (BT * dim).cint)
 
       # Through rotation scan backward
       gpu_rotation_scan_bwd(
@@ -289,8 +291,9 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
     m.drive.adamStep(curLr * 3.0, b1, b2, 0, bc1, bc2)
     m.wOut.adamStep(curLr, b1, b2, wd, bc1, bc2)
     for l in 0..<nL:
-      m.layers[l].monarchL.adamStep(curLr, b1, b2, wd, bc1, bc2)
-      m.layers[l].monarchR.adamStep(curLr, b1, b2, wd, bc1, bc2)
+      m.layers[l].spectralRe.adamStep(curLr, b1, b2, 0, bc1, bc2)
+      m.layers[l].spectralIm.adamStep(curLr, b1, b2, 0, bc1, bc2)
+      m.layers[l].gateProj.adamStep(curLr, b1, b2, wd, bc1, bc2)
       m.layers[l].projGamma.adamStep(curLr, b1, b2, wd, bc1, bc2)
       m.layers[l].projBeta.adamStep(curLr, b1, b2, wd, bc1, bc2)
       m.layers[l].projSense.adamStep(curLr, b1, b2, wd, bc1, bc2)

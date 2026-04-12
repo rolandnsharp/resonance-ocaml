@@ -22,13 +22,10 @@ type
     projGamma*: Param    # dim → n_osc (damping control)
     projBeta*: Param     # dim → n_osc (absorption control)
     projSense*: Param    # dim → n_osc (readout sensitivity)
-    wMix*: Param         # dim × dim (spectral recombination) — or Monarch factored
-    # Monarch factors: two block-diagonal matrices, each nBlocks × blockSize × blockSize
-    monarchL*: Param     # left factor: nBlocks × blockSize × blockSize
-    monarchR*: Param     # right factor: nBlocks × blockSize × blockSize
-    useMonarch*: bool    # if true, use Monarch instead of dense wMix
-    nBlocks*: int
-    blockSize*: int
+    # Spectral mixing: FFT across oscillator dim, learned complex weights, IFFT
+    spectralRe*: Param   # dim/2+1 real parts of spectral weights
+    spectralIm*: Param   # dim/2+1 imag parts
+    gateProj*: Param     # dim → dim/2+1 for content-dependent spectral gate
     mixScale*: Param     # dim (residual scaling)
 
   Model* = object
@@ -93,19 +90,16 @@ proc createModel*(nOsc, nLayers, vocabSize, seqLen: int): Model =
     result.layers[l].projGamma = initParam(dim * nOsc, projScale)
     result.layers[l].projBeta = initParam(dim * nOsc, projScale)
     result.layers[l].projSense = initParam(dim * nOsc, projScale)
-    # Monarch: find best block factorization of dim
-    var bestBlock = 1
-    for s in 2..dim:
-      if dim mod s == 0 and s * s <= dim * 2:
-        bestBlock = s
-    let nBlocks = dim div bestBlock
-    result.layers[l].nBlocks = nBlocks
-    result.layers[l].blockSize = bestBlock
-    result.layers[l].useMonarch = true
-    let monarchScale = 1.0 / sqrt(bestBlock.float32)
-    result.layers[l].monarchL = initParam(nBlocks * bestBlock * bestBlock, monarchScale)
-    result.layers[l].monarchR = initParam(nBlocks * bestBlock * bestBlock, monarchScale)
-    result.layers[l].wMix = initParam(0)  # unused when Monarch is active
+    # Spectral mixing: FFT across dim, learned complex weights
+    let specLen = dim div 2 + 1  # rfft output length
+    result.layers[l].spectralRe = initParam(specLen, 0.0)
+    result.layers[l].spectralIm = initParam(specLen, 0.0)
+    # Init spectral weights to identity (passthrough): real=1, imag=0
+    var onesSpec = newSeq[float32](specLen)
+    for i in 0..<specLen: onesSpec[i] = 1.0
+    result.layers[l].spectralRe.w.gpuUpload(onesSpec)
+    # Content gate projection: dim → specLen
+    result.layers[l].gateProj = initParam(dim * specLen, projScale)
     result.layers[l].mixScale = initParam(dim, 0.0)
     # Init mixScale to ones
     var ones = newSeq[float32](dim)
@@ -185,4 +179,5 @@ proc createModel*(nOsc, nLayers, vocabSize, seqLen: int): Model =
 proc countParams*(m: Model): int =
   result = m.drive.n + m.wOut.n
   for l in m.layers:
-    result += l.projGamma.n + l.projBeta.n + l.projSense.n + l.wMix.n + l.mixScale.n
+    result += l.projGamma.n + l.projBeta.n + l.projSense.n +
+              l.spectralRe.n + l.spectralIm.n + l.gateProj.n + l.mixScale.n
