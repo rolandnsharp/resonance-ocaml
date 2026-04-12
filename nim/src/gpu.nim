@@ -154,3 +154,6 @@ proc gpu_bank_scatter*(conv, state: pointer,
     batchSize, seqLen, n_osc, dim, col_offset: cint, inv_fft: cfloat) {.importc, cdecl.}
 proc gpu_bank_gather*(drives, columns: pointer,
     batchSize, seqLen, n_osc, fft_len: cint) {.importc, cdecl.}
+proc gpu_rotation_scan*(gamma, beta, sense, bank_out, osc_out: pointer,
+    cos_w, sin_w, freqs: pointer,
+    batch_size, seq_len, n_osc: cint) {.importc, cdecl.}

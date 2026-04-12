@@ -42,6 +42,10 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
   for i in 0..<nL:
     mixed[i] = gpuCreate(BT * dim)
 
+  let gammaBuf = gpuCreate(BT * nOsc)
+  let betaBuf = gpuCreate(BT * nOsc)
+  let senseBuf = gpuCreate(BT * nOsc)
+  let oscOutBuf = gpuCreate(BT * dim)
   let actBuf = gpuCreate(BT * dim)
   let logitBuf = gpuCreate(BT * vocab)
   let lossBuf = gpuCreate(BT)
@@ -110,12 +114,27 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
     gpu_bank_scatter(convVelBuf.data, states[0].data,
       batchSize.cint, seqLen.cint, nOsc.cint, dim.cint, nOsc.cint, invFft.cfloat)
 
-    # Layer stack: norm → W → SineGate → residual
+    # Layer stack: norm → project controls → damped rotation → W → SineGate → residual
     for l in 0..<nL:
       gpu_rmsnorm(states[l].data, normed[l].data, dim.cint, BT.cint)
-      gpuSgemm(opNN, BT, dim, dim, normed[l], m.layers[l].wMix.w, mixed[l])
+
+      # Project controls: gamma, beta, sense (dim → n_osc each)
+      gpuSgemm(opNN, BT, nOsc, dim, normed[l], m.layers[l].projGamma.w, gammaBuf)
+      gpu_sigmoid(gammaBuf.data, gammaBuf.data, (BT * nOsc).cint)
+      gpuSgemm(opNN, BT, nOsc, dim, normed[l], m.layers[l].projBeta.w, betaBuf)
+      gpu_sigmoid(betaBuf.data, betaBuf.data, (BT * nOsc).cint)
+      gpuSgemm(opNN, BT, nOsc, dim, normed[l], m.layers[l].projSense.w, senseBuf)
+      gpu_sigmoid(senseBuf.data, senseBuf.data, (BT * nOsc).cint)
+
+      # Damped rotation scan: one kernel, parallel over (batch × oscillator)
+      gpu_rotation_scan(gammaBuf.data, betaBuf.data, senseBuf.data,
+        states[0].data, oscOutBuf.data,
+        m.cosW.data, m.sinW.data, m.freqs.data,
+        batchSize.cint, seqLen.cint, nOsc.cint)
+
+      # W_mix on oscillator output + SineGate + residual
+      gpuSgemm(opNN, BT, dim, dim, oscOutBuf, m.layers[l].wMix.w, mixed[l])
       gpu_sinegate_fwd(mixed[l].data, actBuf.data, (BT * dim).cint)
-      # residual: state[l+1] = state[l] + activated
       gpu_add(states[l].data, actBuf.data, states[l+1].data, (BT * dim).cint)
 
     # Output: norm → W_out → logits

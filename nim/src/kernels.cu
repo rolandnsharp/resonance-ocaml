@@ -350,6 +350,59 @@ __global__ void k_rmsnorm_bwd(const float* x, const float* dout, float* dx,
         dxr[i] = inv * (dor[i] - xr[i] * dot / (rms * rms * dim));
 }
 
+/* ---- Full damped rotation scan over time ----
+   One kernel launch for the entire sequence.
+   Parallel over (batch, oscillator), sequential over time.
+   Layout: gamma/beta/sense are (batch*seqLen, n_osc)
+           bank_out is (batch*seqLen, 2*n_osc)
+           osc_out is (batch*seqLen, 2*n_osc)
+*/
+
+__global__ void k_rotation_scan(
+    const float* gamma, const float* beta, const float* sense,
+    const float* bank_out, float* osc_out,
+    const float* cos_w, const float* sin_w, const float* freqs,
+    int batch_size, int seq_len, int n_osc)
+{
+    // Each thread handles one (batch, oscillator) pair across all timesteps
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * n_osc) return;
+    int b = idx / n_osc;
+    int k = idx % n_osc;
+
+    float pos = 0.0f, vel = 0.0f;
+    float cw = cos_w[k], sw = sin_w[k], f = freqs[k];
+
+    for (int t = 0; t < seq_len; t++) {
+        int row = b * seq_len + t;
+        float g = gamma[row * n_osc + k];
+        float bt = beta[row * n_osc + k];
+        float s = sense[row * n_osc + k];
+        float dp = bank_out[row * 2 * n_osc + k];
+        float dv = bank_out[row * 2 * n_osc + n_osc + k];
+
+        float new_pos = g * (pos * cw + vel * sw / f) + (1.0f - g) * bt * dp;
+        float new_vel = g * (vel * cw - pos * f * sw) + (1.0f - g) * bt * dv;
+        pos = new_pos;
+        vel = new_vel;
+
+        osc_out[row * 2 * n_osc + k] = s * pos;
+        osc_out[row * 2 * n_osc + n_osc + k] = s * vel;
+    }
+}
+
+extern "C" void gpu_rotation_scan(
+    const float* gamma, const float* beta, const float* sense,
+    const float* bank_out, float* osc_out,
+    const float* cos_w, const float* sin_w, const float* freqs,
+    int batch_size, int seq_len, int n_osc)
+{
+    int n = batch_size * n_osc;
+    k_rotation_scan<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(
+        gamma, beta, sense, bank_out, osc_out,
+        cos_w, sin_w, freqs, batch_size, seq_len, n_osc);
+}
+
 /* ---- Sigmoid ---- */
 
 __global__ void k_sigmoid(const float* x, float* out, int n) {
