@@ -403,6 +403,100 @@ extern "C" void gpu_rotation_scan(
         cos_w, sin_w, freqs, batch_size, seq_len, n_osc);
 }
 
+/* ---- Backward rotation scan ----
+   Mirror of k_rotation_scan. One kernel, parallel over (batch × osc).
+   Propagates gradients backward through time, accumulates dgamma/dbeta/dsense.
+
+   Inputs: d_osc_out (upstream grad, from W_mix backward)
+   Outputs: d_gamma, d_beta (pre-sigmoid), d_sense (pre-sigmoid), d_bank_out
+*/
+
+__global__ void k_rotation_scan_bwd(
+    const float* gamma, const float* beta, const float* sense,
+    const float* bank_out, const float* osc_out,
+    const float* d_osc_out,
+    float* d_gamma, float* d_beta, float* d_sense,
+    float* d_bank_out,
+    const float* cos_w, const float* sin_w, const float* freqs,
+    int batch_size, int seq_len, int n_osc)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size * n_osc) return;
+    int b = idx / n_osc;
+    int k = idx % n_osc;
+    float cw = cos_w[k], sw = sin_w[k], f = freqs[k];
+
+    // First: re-run forward to save all (pos, vel) states
+    // We need pos/vel at each timestep for the backward
+    // Store in registers — seq_len is typically 128, too large for registers
+    // Use shared memory or just recompute. Let's recompute by storing in global.
+    // Actually, let's use a simple approach: two passes.
+
+    // Pass 1: Forward, saving prev states into d_bank_out (repurposed as scratch)
+    float pos = 0.0f, vel = 0.0f;
+    for (int t = 0; t < seq_len; t++) {
+        int row = b * seq_len + t;
+        d_bank_out[row * 2 * n_osc + k] = pos;
+        d_bank_out[row * 2 * n_osc + n_osc + k] = vel;
+        float g = gamma[row * n_osc + k];
+        float bt = beta[row * n_osc + k];
+        float dp = bank_out[row * 2 * n_osc + k];
+        float dv = bank_out[row * 2 * n_osc + n_osc + k];
+        pos = g * (pos * cw + vel * sw / f) + (1.0f - g) * bt * dp;
+        vel = g * (vel * cw - pos * f * sw) + (1.0f - g) * bt * dv;
+    }
+
+    // Pass 2: Backward through time
+    float d_pos = 0.0f, d_vel = 0.0f;
+    for (int t = seq_len - 1; t >= 0; t--) {
+        int row = b * seq_len + t;
+        float g = gamma[row * n_osc + k];
+        float bt = beta[row * n_osc + k];
+        float s = sense[row * n_osc + k];
+        float dp = bank_out[row * 2 * n_osc + k];
+        float dv_bank = bank_out[row * 2 * n_osc + n_osc + k];
+        float prev_p = d_bank_out[row * 2 * n_osc + k];
+        float prev_v = d_bank_out[row * 2 * n_osc + n_osc + k];
+
+        float cur_p = g * (prev_p * cw + prev_v * sw / f) + (1.0f - g) * bt * dp;
+        float cur_v = g * (prev_v * cw - prev_p * f * sw) + (1.0f - g) * bt * dv_bank;
+
+        float d_out_p = d_osc_out[row * 2 * n_osc + k];
+        float d_out_v = d_osc_out[row * 2 * n_osc + n_osc + k];
+
+        d_sense[row * n_osc + k] = d_out_p * cur_p + d_out_v * cur_v;
+        d_pos += d_out_p * s;
+        d_vel += d_out_v * s;
+
+        float rot_p = prev_p * cw + prev_v * sw / f;
+        float rot_v = prev_v * cw - prev_p * f * sw;
+        d_gamma[row * n_osc + k] = d_pos * (rot_p - bt * dp) + d_vel * (rot_v - bt * dv_bank);
+        d_beta[row * n_osc + k] = d_pos * (1.0f - g) * dp + d_vel * (1.0f - g) * dv_bank;
+
+        d_bank_out[row * 2 * n_osc + k] = d_pos * (1.0f - g) * bt;
+        d_bank_out[row * 2 * n_osc + n_osc + k] = d_vel * (1.0f - g) * bt;
+
+        float new_d_pos = d_pos * g * cw - d_vel * g * f * sw;
+        float new_d_vel = d_pos * g * sw / f + d_vel * g * cw;
+        d_pos = new_d_pos;
+        d_vel = new_d_vel;
+    }
+}
+
+extern "C" void gpu_rotation_scan_bwd(
+    const float* gamma, const float* beta, const float* sense,
+    const float* bank_out, const float* osc_out, const float* d_osc_out,
+    float* d_gamma, float* d_beta, float* d_sense, float* d_bank_out,
+    const float* cos_w, const float* sin_w, const float* freqs,
+    int batch_size, int seq_len, int n_osc)
+{
+    int n = batch_size * n_osc;
+    k_rotation_scan_bwd<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(
+        gamma, beta, sense, bank_out, osc_out, d_osc_out,
+        d_gamma, d_beta, d_sense, d_bank_out,
+        cos_w, sin_w, freqs, batch_size, seq_len, n_osc);
+}
+
 /* ---- Sigmoid ---- */
 
 __global__ void k_sigmoid(const float* x, float* out, int n) {

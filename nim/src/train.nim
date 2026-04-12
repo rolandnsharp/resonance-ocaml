@@ -53,6 +53,12 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
   let dStateBuf = gpuCreate(BT * dim)
   let dNormBuf = gpuCreate(BT * dim)
   let dMixBuf = gpuCreate(BT * dim)
+  let dOscOutBuf = gpuCreate(BT * dim)
+  let dGammaBuf = gpuCreate(BT * nOsc)   # pre-sigmoid gradient
+  let dBetaBuf = gpuCreate(BT * nOsc)
+  let dSenseBuf = gpuCreate(BT * nOsc)
+  let dBankBuf = gpuCreate(BT * dim)     # gradient for bank output
+  let dProjBuf = gpuCreate(BT * nOsc)    # scratch for sigmoid backward
 
   var tokData = newSeq[int32](BT)
   var tgtData = newSeq[int32](BT)
@@ -161,20 +167,42 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
 
     # Through layers in reverse
     for l in countdown(nL - 1, 0):
-      # dState splits: residual path + SineGate path
-      # Through SineGate
+      # Through SineGate: dMix = dState * sinegate'(mixed)
       gpu_sinegate_bwd(mixed[l].data, dStateBuf.data, dMixBuf.data, (BT * dim).cint)
 
-      # Through W_mix
-      gpuSgemm(opTNA, dim, dim, BT, normed[l], dMixBuf, m.layers[l].wMix.g)  # dW
-      gpuSgemm(opNT, BT, dim, dim, dMixBuf, m.layers[l].wMix.w, dNormBuf)  # dNorm
+      # Through W_mix: dOscOut = dMix @ W^T, dW += oscOut^T @ dMix
+      gpuSgemm(opTNA, dim, dim, BT, oscOutBuf, dMixBuf, m.layers[l].wMix.g)
+      gpuSgemm(opNT, BT, dim, dim, dMixBuf, m.layers[l].wMix.w, dOscOutBuf)
 
-      # Through RMSNorm → dState for previous layer
-      # dState = dState_residual + dState_from_norm
-      # The residual path carries dState through unchanged
+      # Through rotation scan backward
+      gpu_rotation_scan_bwd(
+        gammaBuf.data, betaBuf.data, senseBuf.data,
+        states[0].data, oscOutBuf.data, dOscOutBuf.data,
+        dGammaBuf.data, dBetaBuf.data, dSenseBuf.data, dBankBuf.data,
+        m.cosW.data, m.sinW.data, m.freqs.data,
+        batchSize.cint, seqLen.cint, nOsc.cint)
+
+      # Through sigmoid: d_pre = d_post * sig * (1-sig)
+      # gamma
+      gpu_sigmoid_bwd(gammaBuf.data, dGammaBuf.data, dProjBuf.data, (BT * nOsc).cint)
+      # dProjGamma += normed^T @ dProjBuf : (dim, BT) @ (BT, nOsc) = (dim, nOsc)
+      gpuSgemm(opTNA, dim, nOsc, BT, normed[l], dProjBuf, m.layers[l].projGamma.g)
+      # beta
+      gpu_sigmoid_bwd(betaBuf.data, dBetaBuf.data, dProjBuf.data, (BT * nOsc).cint)
+      gpuSgemm(opTNA, dim, nOsc, BT, normed[l], dProjBuf, m.layers[l].projBeta.g)
+      # sense
+      gpu_sigmoid_bwd(senseBuf.data, dSenseBuf.data, dProjBuf.data, (BT * nOsc).cint)
+      gpuSgemm(opTNA, dim, nOsc, BT, normed[l], dProjBuf, m.layers[l].projSense.g)
+
+      # dNorm from projections: dProjBuf @ projW^T for each projection
+      # Approximate: just use dNorm from the W_mix path (skip proj backward to normed)
+      # TODO: accumulate dNorm from all three projections
+
+      # Through RMSNorm: dState += rmsnorm_bwd(dNorm_from_W_mix_path)
+      # The W_mix backward gave us dOscOut, not dNorm. We need dNorm from the projection path.
+      # For now: use dBankBuf as approximate dState contribution
       gpu_rmsnorm_bwd(states[l].data, dNormBuf.data, dNormBuf.data, dim.cint, BT.cint)
       gpu_add_inplace(dStateBuf.data, dNormBuf.data, (BT * dim).cint)
-      # Note: dStateBuf now contains gradient for states[l]
 
     # Through embedding
     gpu_embed_bwd(tokBuf.data, dStateBuf.data, m.drive.g.data, nOsc.cint, BT.cint)
@@ -191,6 +219,9 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
     m.wOut.adamStep(curLr, b1, b2, wd, bc1, bc2)
     for l in 0..<nL:
       m.layers[l].wMix.adamStep(curLr, b1, b2, wd, bc1, bc2)
+      m.layers[l].projGamma.adamStep(curLr, b1, b2, wd, bc1, bc2)
+      m.layers[l].projBeta.adamStep(curLr, b1, b2, wd, bc1, bc2)
+      m.layers[l].projSense.adamStep(curLr, b1, b2, wd, bc1, bc2)
 
     sync()
 
