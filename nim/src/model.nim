@@ -1,0 +1,122 @@
+## Resonance model — damped rotation neural network.
+##
+## Architecture:
+##   bank(FFT, once) → [rotate → project → mix → SineGate → residual] × L → project → readout
+##
+## One equation per oscillator per layer:
+##   pos' = γ(t)·[pos·cos(ω) + vel·sin(ω)/ω] + (1-γ(t))·β(t)·drive_pos
+##   vel' = γ(t)·[vel·cos(ω) - pos·ω·sin(ω)] + (1-γ(t))·β(t)·drive_vel
+
+import std/[math, strformat, random]
+import gpu
+
+type
+  Param* = object
+    w*: GpuBuf      # weights
+    g*: GpuBuf      # gradients
+    m*: GpuBuf      # Adam momentum
+    v*: GpuBuf      # Adam velocity
+    n*: int         # number of elements
+
+  Layer* = object
+    projGamma*: Param    # dim → n_osc (damping control)
+    projBeta*: Param     # dim → n_osc (absorption control)
+    projSense*: Param    # dim → n_osc (readout sensitivity)
+    wMix*: Param         # dim × dim (spectral recombination)
+    mixScale*: Param     # dim (residual scaling)
+
+  Model* = object
+    nOsc*: int
+    dim*: int
+    nLayers*: int
+    vocabSize*: int
+    seqLen*: int
+    # Weights
+    drive*: Param        # vocabSize × nOsc (token → oscillator excitation)
+    layers*: seq[Layer]
+    wOut*: Param         # dim × vocabSize (final projection)
+    # Oscillator constants (precomputed, not learned)
+    cosW*: GpuBuf        # cos(ω) per oscillator
+    sinW*: GpuBuf        # sin(ω) per oscillator
+    freqs*: GpuBuf       # ω per oscillator
+    # Bank kernels (for FFT encoding)
+    hPosFft*: GpuBuf     # FFT of position impulse responses
+    hVelFft*: GpuBuf     # FFT of velocity impulse responses
+
+proc initParam(n: int, initStd: float32 = 0.0): Param =
+  result.n = n
+  result.w = gpuAlloc(n)
+  result.g = gpuAlloc(n)
+  result.m = gpuAlloc(n)
+  result.v = gpuAlloc(n)
+  if initStd > 0:
+    var data = newSeq[float32](n)
+    for i in 0..<n:
+      # Box-Muller
+      let u1 = rand(1.0).float32 + 1e-7
+      let u2 = rand(1.0).float32
+      data[i] = sqrt(-2.0 * ln(u1)).float32 * cos(2.0 * PI * u2).float32 * initStd
+    result.w.upload(data)
+
+proc adamStep*(p: var Param, lr, b1, b2, wd, bc1, bc2: float32) =
+  if p.n > 0:
+    gpu_adamw(p.w.data, p.g.data, p.m.data, p.v.data,
+              lr.cfloat, b1.cfloat, b2.cfloat, wd.cfloat,
+              bc1.cfloat, bc2.cfloat, p.n.cint)
+
+proc createModel*(nOsc, nLayers, vocabSize, seqLen: int): Model =
+  let dim = nOsc * 2
+  let scale = 1.0 / sqrt(dim.float32)
+  let projScale = 0.1 / sqrt(nOsc.float32)
+
+  result.nOsc = nOsc
+  result.dim = dim
+  result.nLayers = nLayers
+  result.vocabSize = vocabSize
+  result.seqLen = seqLen
+
+  # Drive table
+  result.drive = initParam(vocabSize * nOsc, 0.02)
+
+  # Output projection
+  result.wOut = initParam(dim * vocabSize, 0.001)
+
+  # Layers
+  result.layers = newSeq[Layer](nLayers)
+  for l in 0..<nLayers:
+    result.layers[l].projGamma = initParam(dim * nOsc, projScale)
+    result.layers[l].projBeta = initParam(dim * nOsc, projScale)
+    result.layers[l].projSense = initParam(dim * nOsc, projScale)
+    result.layers[l].wMix = initParam(dim * dim, scale)
+    result.layers[l].mixScale = initParam(dim, 0.0)
+    # Init mixScale to ones
+    var ones = newSeq[float32](dim)
+    for i in 0..<dim: ones[i] = 1.0
+    result.layers[l].mixScale.w.upload(ones)
+
+  # Precompute oscillator constants
+  var cosData = newSeq[float32](nOsc)
+  var sinData = newSeq[float32](nOsc)
+  var freqData = newSeq[float32](nOsc)
+  for k in 0..<nOsc:
+    let f = 0.1 + (PI - 0.1) * k.float32 / max(1, nOsc - 1).float32
+    freqData[k] = f
+    cosData[k] = cos(f)
+    sinData[k] = sin(f)
+
+  result.cosW = gpuAlloc(nOsc)
+  result.sinW = gpuAlloc(nOsc)
+  result.freqs = gpuAlloc(nOsc)
+  result.cosW.upload(cosData)
+  result.sinW.upload(sinData)
+  result.freqs.upload(freqData)
+
+  echo &"Resonance: {nOsc} osc, {nLayers} layers, dim={dim}, vocab={vocabSize}"
+  let nParams = vocabSize * nOsc + dim * vocabSize +
+    nLayers * (3 * dim * nOsc + dim * dim + dim)
+  echo &"Parameters: {nParams}"
+
+proc countParams*(m: Model): int =
+  result = m.drive.n + m.wOut.n
+  for l in m.layers:
+    result += l.projGamma.n + l.projBeta.n + l.projSense.n + l.wMix.n + l.mixScale.n
