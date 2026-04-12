@@ -83,6 +83,8 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
   let dDriveVelFft = gpuCreate(totalOsc * fftCLen * 2)
   let dDriveFft = gpuCreate(totalOsc * fftCLen * 2)
   let dDriveConv = gpuCreate(totalOsc * fftLen)
+  let dPosTmp = gpuCreate(BT * nOsc)
+  let dVelTmp = gpuCreate(BT * nOsc)
 
   let t0 = epochTime()
 
@@ -222,16 +224,13 @@ proc train(m: var Model, data: seq[int32], steps, seqLen, batchSize: int, lr: fl
     # Through FFT bank (adjoint): dState → dDrives via conj(H) convolution
     dBankPosBuf.gpuZero()
     dBankVelBuf.gpuZero()
-    # Gather pos gradients: dState[:, 0:n_osc] → (batch*n_osc, fft_len)
-    gpu_bank_gather(dStateBuf.data, dBankPosBuf.data,
-      batchSize.cint, seqLen.cint, nOsc.cint, fftLen.cint)
-    # For vel, we need to gather from offset n_osc — extract vel part of dState
-    # dState is (BT, dim) where dim=2*n_osc, vel is at columns [n_osc, 2*n_osc)
-    # bank_gather extracts columns [0, n_osc) — need to offset the source
-    gpu_bank_gather(
-      cast[pointer](cast[int](dStateBuf.data) + nOsc * 4),  # offset by n_osc floats
-      dBankVelBuf.data,
-      batchSize.cint, seqLen.cint, nOsc.cint, fftLen.cint)
+    # Extract pos/vel from dState (BT, dim) → contiguous (BT, nOsc) → transposed (batch*nOsc, fftLen)
+    gpu_strided_gather(dStateBuf.data, dPosTmp.data, BT.cint, dim.cint, nOsc.cint, 0.cint)
+    gpu_strided_gather(dStateBuf.data, dVelTmp.data, BT.cint, dim.cint, nOsc.cint, nOsc.cint)
+    dBankPosBuf.gpuZero()
+    dBankVelBuf.gpuZero()
+    gpu_bank_gather(dPosTmp.data, dBankPosBuf.data, batchSize.cint, seqLen.cint, nOsc.cint, fftLen.cint)
+    gpu_bank_gather(dVelTmp.data, dBankVelBuf.data, batchSize.cint, seqLen.cint, nOsc.cint, fftLen.cint)
     # FFT, multiply by conj(H), IFFT
     discard gpu_fft_r2c_batched(dBankPosBuf.data, dPosFft.data, fftLen.cint, totalOsc.cint)
     discard gpu_fft_r2c_batched(dBankVelBuf.data, dVelFft.data, fftLen.cint, totalOsc.cint)

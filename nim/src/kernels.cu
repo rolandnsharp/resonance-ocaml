@@ -316,6 +316,27 @@ extern "C" void gpu_bank_gather(const float* drives, float* columns,
         batchSize, seqLen, n_osc, fft_len);
 }
 
+// Strided gather: extract n_osc columns starting at col_offset from (rows, stride) matrix
+__global__ void k_strided_gather(const float* src, float* dst,
+                                  int rows, int stride, int n_osc, int col_offset, int fft_len) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * n_osc;
+    if (idx >= total) return;
+    int row = idx / n_osc;
+    int k = idx % n_osc;
+    // Zero-padded output: dst is (rows, fft_len), we write to position k within each row
+    // But we want (n_osc_groups, fft_len) layout for batched FFT
+    // Actually: group by oscillator across batch*seq. Need (batch*n_osc, fft_len) layout.
+    // This is more complex. Let's just extract (rows, n_osc) contiguously.
+    dst[row * n_osc + k] = src[row * stride + col_offset + k];
+}
+
+extern "C" void gpu_strided_gather(const float* src, float* dst,
+                                    int rows, int stride, int n_osc, int col_offset) {
+    int n = rows * n_osc;
+    k_strided_gather<<<(n+BLOCK-1)/BLOCK, BLOCK>>>(src, dst, rows, stride, n_osc, col_offset, 0);
+}
+
 /* ---- Element-wise add: y = a + b ---- */
 
 __global__ void k_add(const float* a, const float* b, float* y, int n) {
