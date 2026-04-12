@@ -82,11 +82,13 @@ proc createModel*(nOsc, nLayers, vocabSize, seqLen: int): Model =
   result.vocabSize = vocabSize
   result.seqLen = seqLen
 
-  # Drive table
-  result.drive = initParam(vocabSize * nOsc, 0.02)
+  # Drive table — scale by 1/sqrt(seqLen) so bank output stays bounded
+  let driveScale = 0.02 / sqrt(max(1, seqLen).float32 / 128.0)
+  result.drive = initParam(vocabSize * nOsc, driveScale)
 
-  # Output projection
-  result.wOut = initParam(dim * vocabSize, 0.001)
+  # Output projection — scale by 1/sqrt(dim * vocab) for stable logits
+  let outScale = 1.0 / sqrt(dim.float32 * vocabSize.float32)
+  result.wOut = initParam(dim * vocabSize, outScale)
 
   # Layers
   result.layers = newSeq[Layer](nLayers)
@@ -94,8 +96,9 @@ proc createModel*(nOsc, nLayers, vocabSize, seqLen: int): Model =
     result.layers[l].projGamma = initParam(dim * nOsc, projScale)
     result.layers[l].projBeta = initParam(dim * nOsc, projScale)
     result.layers[l].projSense = initParam(dim * nOsc, projScale)
-    # Interference: dense W computes all pairwise cross-terms between oscillators
-    result.layers[l].spectralRe = initParam(dim * dim, scale)  # reuse field as wMix
+    # Interference: dense W — init near zero so residual dominates early
+    let wMixScale = 0.01 / sqrt(dim.float32)
+    result.layers[l].spectralRe = initParam(dim * dim, wMixScale)
     result.layers[l].spectralIm = initParam(0)  # unused
     result.layers[l].gateProj = initParam(0)   # unused
     # Projection biases
